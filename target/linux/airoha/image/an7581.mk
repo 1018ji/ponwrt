@@ -58,7 +58,6 @@ define Device/airoha_an7581-evb
   DEVICE_MODEL := AN7581 Evaluation Board (SNAND)
   DEVICE_PACKAGES := kmod-leds-pwm kmod-pwm-airoha kmod-input-gpio-keys-polled
   DEVICE_DTS := an7581-evb
-  DEVICE_DTS_CONFIG := config@1
   IMAGE/sysupgrade.bin := append-kernel | pad-to 128k | append-rootfs | pad-rootfs | append-metadata
   ARTIFACT/preloader.bin := an7581-preloader rfb
   ARTIFACT/bl31-uboot.fip := an7581-bl31-uboot rfb
@@ -173,7 +172,6 @@ define Device/fiberhome_hg5382a
   DEVICE_VENDOR := FiberHome
   DEVICE_MODEL := HG5382A
   DEVICE_DTS := an7581-fiberhome-hg5382a
-  DEVICE_DTS_CONFIG := config@1
   KERNEL_LOADADDR := 0x8c000000
   BLOCKSIZE := 128k
   PAGESIZE := 2048
@@ -198,7 +196,6 @@ TARGET_DEVICES += fiberhome_hg5382a
 define Device/fiberhome_hg5585f-common
   $(call Device/FitImageLzma)
   DEVICE_VENDOR := FiberHome
-  DEVICE_DTS_CONFIG := config@1
   KERNEL_LOADADDR := 0x8a000000
   BLOCKSIZE := 128k
   PAGESIZE := 2048
@@ -269,7 +266,6 @@ TARGET_DEVICES += fiberhome_hg5585f-cu-usb-sfp
 define Device/znxt_zn50xg-d-common
   DEVICE_VENDOR := ZNXT
   DEVICE_VARIANT := (UBI)
-  DEVICE_DTS_CONFIG := config-1
   # 0x8a000000 follows NPU/QDMA reserved memory and holds recovery decompression.
   KERNEL_LOADADDR := 0x8a000000
   BLOCKSIZE := 128k
@@ -317,7 +313,6 @@ define Device/unionman_ung00a
   DEVICE_VENDOR := Unionman
   DEVICE_MODEL := UNG00A
   DEVICE_DTS := an7581-unionman-ung00a
-  DEVICE_DTS_CONFIG := config@1
   KERNEL_LOADADDR := 0x8a000000
   BLOCKSIZE := 128k
   PAGESIZE := 2048
@@ -342,7 +337,6 @@ define Device/h3c_hm2004-du
   DEVICE_VENDOR := H3C
   DEVICE_MODEL := HM2004-DU
   DEVICE_DTS := an7581-h3c-hm2004-du
-  DEVICE_DTS_CONFIG := config@1
   KERNEL_LOADADDR := 0x8a000000
   BLOCKSIZE := 128k
   PAGESIZE := 2048
