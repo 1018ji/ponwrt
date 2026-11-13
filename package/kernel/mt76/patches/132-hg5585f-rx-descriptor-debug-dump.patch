@@ -24,8 +24,8 @@ log. The switch does not change ownership, force-to-CPU mode, or forwarding.
 +		dev_info_ratelimited(dev->dev,
 +			"hg5585f-rx-ppe dev=%s len=%u info=%08x hash=%u crsn=%u active=%u\n",
 +			skb->dev ? skb->dev->name : "?", skb->len, info,
-+			FIELD_GET(NPU_RX_DMA_FOE_ID_MASK, info),
-+			FIELD_GET(NPU_RX_DMA_CRSN_MASK, info),
++			(unsigned int)FIELD_GET(NPU_RX_DMA_FOE_ID_MASK, info),
++			(unsigned int)FIELD_GET(NPU_RX_DMA_CRSN_MASK, info),
 +			mt76_npu_device_active(dev));
 --- a/npu_rx_legacy.c
 +++ b/npu_rx_legacy.c
