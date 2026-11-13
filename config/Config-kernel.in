@@ -1681,3 +1681,43 @@ config KERNEL_PREEMPT_RT
 	  require real-time guarantees.
 
 endchoice
+
+config KERNEL_NET_AIROHA_WED
+	bool "HG5585F MT7916 WED transmit offload (experimental)"
+	depends on TARGET_airoha_an7581
+	depends on !KERNEL_NET_AIROHA_WLAN_DIAG
+	depends on !KERNEL_NET_AIROHA_NPU_HG5585F || KERNEL_NET_AIROHA_PPE_HG5585F
+	default n
+	help
+	  Build the WED1/WDMA1 transmit provider and its optional FIT overlay.
+	  Uses upstream firmware or explicitly selected host-managed legacy PPE.
+	  With the NPU RX package, adds a combined transmit/receive FIT overlay.
+	  Requires the WED FIT configuration; the base configuration stays default.
+
+config KERNEL_NET_AIROHA_WLAN_DIAG
+	bool "HG5585F WED1/WDMA1 register diagnostics (experimental)"
+	depends on TARGET_airoha_an7581 && KERNEL_DEBUG_FS
+	default n
+	help
+	  Expose read-only WED1/WDMA1 and NPU host RX queue status in debugfs.
+	  Requires the explicit HG5585F WLAN diagnostic device-tree overlay.
+	  Does not redirect interrupts, enable DMA or switch NPU firmware.
+
+config KERNEL_NET_AIROHA_NPU_HG5585F
+	bool "HG5585F stock NPU WLAN ABI (experimental)"
+	depends on TARGET_airoha_an7581
+	default n
+	help
+	  Enable the explicitly selected HG5585F 2024 WLAN firmware ABI.
+	  Requires matching local firmware and an explicit device-tree overlay.
+	  Stock firmware has no verified upstream PPE ABI; PPE calls are rejected.
+	  The optional MT7915 NPU RX package adds receive/reorder with Linux forwarding.
+
+config KERNEL_NET_AIROHA_PPE_HG5585F
+	bool "HG5585F host-managed PPE (experimental)"
+	depends on TARGET_airoha_an7581 && KERNEL_NET_AIROHA_NPU_HG5585F
+	default n
+	help
+	  Initialize PPE from Linux while using the HG5585F 2024 NPU firmware.
+	  Builds a separate FIT overlay when the local firmware package is selected.
+	  Firmware byte counters are unavailable; Wi-Fi receive is selected separately.

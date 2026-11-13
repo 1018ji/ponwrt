@@ -182,6 +182,13 @@ define Device/fiberhome_hg5585f-common
   KERNEL_IN_UBI := 1
   KERNEL := kernel-bin | gzip
   KERNEL_INITRAMFS_SUFFIX := -recovery.itb
+  DEVICE_DTS_OVERLAY := $(if $(and $(filter y,$(CONFIG_KERNEL_NET_AIROHA_NPU_HG5585F)),$(filter y,$(CONFIG_PACKAGE_airoha-hg5585f-npu-firmware))),an7581-hg5585f-npu-legacy)
+  DEVICE_DTS_OVERLAY += $(if $(filter y,$(CONFIG_KERNEL_NET_AIROHA_WLAN_DIAG)),an7581-hg5585f-wlan-diagnostics)
+  DEVICE_DTS_OVERLAY += $(if $(filter y,$(CONFIG_KERNEL_NET_AIROHA_WED)),an7581-hg5585f-wed-tx)
+  DEVICE_DTS_OVERLAY += $(if $(filter y,$(CONFIG_PACKAGE_MT7915_NPU_RX)),an7581-hg5585f-npu-rx)
+  DEVICE_DTS_OVERLAY += $(if $(and $(filter y,$(CONFIG_KERNEL_NET_AIROHA_PPE_HG5585F)),$(filter y,$(CONFIG_PACKAGE_airoha-hg5585f-npu-firmware))),an7581-hg5585f-ppe)
+  DEVICE_DTS_OVERLAY += $(if $(and $(filter y,$(CONFIG_KERNEL_NET_AIROHA_WED)),$(filter y,$(CONFIG_KERNEL_NET_AIROHA_PPE_HG5585F)),$(filter y,$(CONFIG_PACKAGE_MT7915_NPU_RX))),an7581-hg5585f-npu-wed)
+  DEVICE_DTC_FLAGS := $$(if $$(strip $$(DEVICE_DTS_OVERLAY)),-@)
   IMAGES := sysupgrade.itb
   # PON and MT7916D read per-device calibration from factory UBI NVMEM cells.
   DEVICE_PACKAGES := kmod-gpio-button-hotplug kmod-leds-gpio kmod-usb3 \
@@ -199,11 +206,25 @@ define Device/fiberhome_hg5585f-images
 	append-metadata
 endef
 
+# Fold the shared offload description into the default CT DTB.
+define Device/fiberhome_hg5585f-ct-offload
+  DEVICE_DTS := an7581-fiberhome-hg5585f-ct-npu-wed
+  DEVICE_DTS_OVERLAY :=
+  DEVICE_DTC_FLAGS :=
+  DEVICE_PACKAGES += airoha-hg5585f-npu-firmware hg5585f-offload-tools
+endef
+
 define Device/fiberhome_hg5585f-ct
   $(call Device/fiberhome_hg5585f-common)
   DEVICE_MODEL := HG5585F
   DEVICE_VARIANT := CT
   DEVICE_DTS := an7581-fiberhome-hg5585f-ct
+  $(if $(and $(filter y,$(CONFIG_KERNEL_NET_AIROHA_NPU_HG5585F)), \
+      $(filter y,$(CONFIG_KERNEL_NET_AIROHA_PPE_HG5585F)), \
+      $(filter y,$(CONFIG_KERNEL_NET_AIROHA_WED)), \
+      $(filter y,$(CONFIG_PACKAGE_MT7915_NPU_RX)), \
+      $(filter y,$(CONFIG_PACKAGE_airoha-hg5585f-npu-firmware))), \
+    $(call Device/fiberhome_hg5585f-ct-offload))
   DEVICE_PACKAGES += kmod-phy-maxlinear
   SUPPORTED_DEVICES += fiberhome,hg5585f-ct-usb-sfp
   $(call Device/fiberhome_hg5585f-images)

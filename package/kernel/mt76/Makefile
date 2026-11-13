@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=mt76
-PKG_RELEASE:=2
+PKG_RELEASE:=13
 
 PKG_LICENSE:=BSD-3-Clause-Clear
 PKG_LICENSE_FILES:=
@@ -25,6 +25,10 @@ PKG_CONFIG_DEPENDS += \
 	CONFIG_PACKAGE_kmod-mt76x2 \
 	CONFIG_PACKAGE_kmod-mt76x2u \
 	CONFIG_PACKAGE_kmod-mt7603 \
+	CONFIG_PACKAGE_MT7915_NPU_PROBE \
+	CONFIG_PACKAGE_MT7915_NPU_RX_BACKEND \
+	CONFIG_PACKAGE_MT7915_NPU_RX \
+	CONFIG_KERNEL_NET_AIROHA_WED \
 	CONFIG_PACKAGE_CFG80211_TESTMODE
 
 STAMP_CONFIGURED_DEPENDS := $(STAGING_DIR)/usr/include/mac80211-backport/backport/autoconf.h
@@ -238,8 +242,11 @@ define KernelPackage/mt7915e
   DEPENDS+=@PCI_SUPPORT +kmod-mt76-connac +kmod-hwmon-core +kmod-thermal +@DRIVER_11AX_SUPPORT +@KERNEL_RELAY
   FILES:= $(PKG_BUILD_DIR)/mt7915/mt7915e.ko
   AUTOLOAD:=$(call AutoProbe,mt7915e)
-ifneq ($(CONFIG_TARGET_mediatek_filogic)$(CONFIG_TARGET_mediatek_mt7622),)
+ifneq ($(CONFIG_TARGET_mediatek_filogic)$(CONFIG_TARGET_mediatek_mt7622)$(CONFIG_KERNEL_NET_AIROHA_WED),)
   MODPARAMS.mt7915e:=wed_enable=Y
+endif
+ifdef CONFIG_PACKAGE_MT7915_NPU_PROBE
+  MODPARAMS.mt7915e+=npu_probe=Y
 endif
 endef
 
@@ -247,6 +254,38 @@ define KernelPackage/mt7916-firmware
   $(KernelPackage/mt76-default)
   DEPENDS+=+kmod-mt7915e
   TITLE:=MediaTek MT7916 firmware
+endef
+
+define KernelPackage/mt7915e/config
+	config PACKAGE_MT7915_NPU_PROBE
+		bool "MT7916 Airoha NPU capability diagnostics"
+		depends on PACKAGE_kmod-mt7915e && TARGET_airoha_an7581
+		default n
+		help
+		  Build the opt-in npu_probe module parameter and debugfs snapshot.
+		  This queries NPU firmware without redirecting Wi-Fi traffic.
+
+	config PACKAGE_MT7915_NPU_RX_BACKEND
+		bool "Compile HG5585F legacy NPU RX backend (experimental)"
+		depends on PACKAGE_kmod-mt7915e && TARGET_airoha_an7581
+		default n
+		help
+		  Build the 256-slot host RX queue and packet reassembly backend.
+		  This option alone does not redirect Wi-Fi traffic. The separate
+		  RX FIT configuration enables the input ring handoff.
+
+	config PACKAGE_MT7915_NPU_RX
+		bool "HG5585F NPU receive/reorder with Linux forwarding (experimental)"
+		depends on PACKAGE_kmod-mt7915e && TARGET_airoha_an7581
+		depends on KERNEL_NET_AIROHA_NPU_HG5585F
+		select PACKAGE_MT7915_NPU_RX_BACKEND
+		select PACKAGE_airoha-hg5585f-npu-firmware
+		default n
+		help
+		  Build a separate HG5585F FIT overlay for stock NPU receive DMA
+		  and packet reordering. Receive forwarding stays in Linux.
+		  Host-managed legacy PPE plus WED adds a combined FIT overlay
+		  with WED transmit and NPU receive/reorder.
 endef
 
 define KernelPackage/mt7981-firmware
@@ -479,6 +518,14 @@ ifdef CONFIG_PACKAGE_kmod-mt7663u
 endif
 ifdef CONFIG_PACKAGE_kmod-mt7915e
   PKG_MAKE_FLAGS += CONFIG_MT7915E=m
+  ifdef CONFIG_PACKAGE_MT7915_NPU_PROBE
+    PKG_MAKE_FLAGS += CONFIG_MT7915_NPU_PROBE=y
+    NOSTDINC_FLAGS += -DCONFIG_MT7915_NPU_PROBE
+  endif
+  ifdef CONFIG_PACKAGE_MT7915_NPU_RX_BACKEND
+    PKG_MAKE_FLAGS += CONFIG_MT76_NPU=y CONFIG_MT76_NPU_LEGACY=y
+    NOSTDINC_FLAGS += -DCONFIG_MT76_NPU -DCONFIG_MT76_NPU_LEGACY
+  endif
   ifdef CONFIG_TARGET_mediatek_filogic
     PKG_MAKE_FLAGS += CONFIG_MT798X_WMAC=y
     NOSTDINC_FLAGS += -DCONFIG_MT798X_WMAC

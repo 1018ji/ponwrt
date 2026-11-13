@@ -1,0 +1,80 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] wifi: mt76: respect the HG5585F RX producer commit
+
+The stock firmware sets DONE before writing metadata and advances its
+producer last. Bound complete fragment transactions by that committed
+index. Distinguish a full 256-slot ring from an empty ring by checking the
+predecessor and then re-reading the producer. Quarantine invalid indices
+without returning DMA pages.
+
+---
+--- a/npu_rx_legacy.c
++++ b/npu_rx_legacy.c
+@@ -78,13 +78,48 @@
+ 	return 0;
+ }
+ 
++static int mt76_npu_legacy_rx_available(struct mt76_queue *q)
++{
++	struct airoha_wlan_legacy_rx_desc *desc = (void *)q->desc;
++	u32 producer = Q_READ(q, cpu_idx);
++	unsigned int previous = (q->tail + q->ndesc - 1) % q->ndesc;
++
++	if (producer >= (unsigned int)q->ndesc)
++		return -EIO;
++	if (producer == q->tail) {
++		/* All slots are usable: DONE in the predecessor distinguishes full.
++		 * Firmware writes DONE before metadata and commits the producer last.
++		 * Re-read the producer after DONE so an in-progress wrap is not full.
++		 */
++		if (!(le32_to_cpu(READ_ONCE(desc[previous].ctrl)) &
++		      AIROHA_WLAN_LEGACY_RX_DONE))
++			return 0;
++		dma_rmb();
++		producer = Q_READ(q, cpu_idx);
++		if (producer >= (unsigned int)q->ndesc)
++			return -EIO;
++		if (producer == q->tail) {
++			dma_rmb();
++			return q->ndesc;
++		}
++	}
++	/* Metadata is valid only after the firmware's producer commit. */
++	dma_rmb();
++
++	return (producer + q->ndesc - q->tail) % q->ndesc;
++}
++
+ static int
+ mt76_npu_legacy_rx_peek(struct mt76_queue *q,
+ 			struct airoha_wlan_legacy_rx_meta *meta)
+ {
+ 	struct airoha_wlan_legacy_rx_desc *desc = (void *)q->desc;
+ 	unsigned int index = q->tail;
+-	int count = 1, i, err;
++	int available, count = 1, i, err;
++
++	available = mt76_npu_legacy_rx_available(q);
++	if (available <= 0)
++		return available ? available : -EAGAIN;
+ 
+ 	for (i = 0; i < count; i++) {
+ 		struct mt76_queue_entry *e = &q->entry[index];
+@@ -107,6 +142,8 @@
+ 			count = meta[0].fragments;
+ 			if (count > q->queued || count > AIROHA_WLAN_LEGACY_RX_MAX_FRAGS)
+ 				return -EBADMSG;
++			if (count > available)
++				return -EAGAIN;
+ 		}
+ 		index = (index + 1) % q->ndesc;
+ 	}
+@@ -160,7 +197,7 @@
+ 	if (count == -EIO) {
+ 		/* Preserve buffers and descriptors for teardown after DMA is stopped. */
+ 		q->stopped = true;
+-		dev_err_ratelimited(dev->dev, "legacy NPU RX descriptor ownership mismatch\n");
++		dev_err_ratelimited(dev->dev, "legacy NPU RX invalid ring state\n");
+ 		return NULL;
+ 	}
+ 	if (count < 0) {

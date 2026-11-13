@@ -1,0 +1,23 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] dt-bindings: net: describe HG5585F host-managed PPE
+
+Describe the explicit Ethernet selection for a Linux-managed PPE with
+the HG5585F 2024 WLAN firmware ABI.
+
+---
+--- a/Documentation/devicetree/bindings/net/airoha,en7581-eth.yaml
++++ b/Documentation/devicetree/bindings/net/airoha,en7581-eth.yaml
+@@ -72,6 +72,13 @@
+ 
+   "#size-cells":
+     const: 0
++
++  airoha,hg5585f-ppe:
++    type: boolean
++    description:
++      Use host-managed PPE initialization with the HG5585F 2024 NPU
++      firmware ABI. Linux owns the FOE table and programs the PPE directly.
++      Firmware flow statistics are unavailable in this mode.
+ 
+   airoha,npu:
+     $ref: /schemas/types.yaml#/definitions/phandle

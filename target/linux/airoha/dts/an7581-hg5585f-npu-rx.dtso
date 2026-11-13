@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/reset/airoha,en7581-reset.h>
+
+/* Stock NPU receive/reorder with Linux forwarding. */
+&{/reserved-memory} {
+	#address-cells = <2>;
+	#size-cells = <2>;
+	ranges;
+
+	hg5585f_rxpkt: npu-rx-pkt@98000000 {
+		no-map;
+		reg = <0x0 0x98000000 0x0 0x600000>;
+	};
+
+	hg5585f_rxba: npu-rx-ba@98600000 {
+		no-map;
+		reg = <0x0 0x98600000 0x0 0x80000>;
+	};
+};
+
+&npu {
+	reg = <0x0 0x1e900000 0x0 0x313000>,
+	      <0x0 0x1fb30000 0x0 0x2b0>;
+	reg-names = "npu", "rx-copy";
+	resets = <&scuclk EN7581_NPU_RST>, <&scuclk EN7581_GDMA_RST>;
+	reset-names = "npu", "rx-copy";
+	airoha,wlan-firmware-abi = "hg5585f-2024";
+	firmware-name = "airoha/hg5585f_npu_rv32.bin",
+			"airoha/hg5585f_npu_data.bin";
+	memory-region = <&npu_binary>, <&hg5585f_rxpkt>, <&hg5585f_rxba>;
+	memory-region-names = "binary", "pkt", "ba";
+};
+
+&hg5585f_wifi {
+	airoha,hg5585f-rx-offload;
+};

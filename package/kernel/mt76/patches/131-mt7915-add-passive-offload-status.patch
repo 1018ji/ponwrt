@@ -1,0 +1,167 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] wifi: mt76: expose passive HG5585F offload status
+
+Expose a read-only status file independent of the optional firmware probe.
+Record NPU host delivery and drop counters once per poll, and read the
+verified WED transmit MIBs only while running with read-clear disabled.
+Include recovery and instance identifiers so userspace can distinguish
+counter wrap, reload, quiescence and terminal DMA quarantine.
+
+---
+--- a/mt76.h
++++ b/mt76.h
+@@ -740,6 +740,8 @@
+ 	int npu_type;
+ 	bool npu_legacy_rx;
+ 	bool npu_quarantined;
++	atomic_t npu_rx_host_packets;
++	atomic_t npu_rx_host_errors;
+ };
+ 
+ struct mt76_rx_status {
+--- a/mt7915/debugfs.c
++++ b/mt7915/debugfs.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: BSD-3-Clause-Clear
+ /* Copyright (C) 2020 MediaTek Inc. */
+ 
++#include <linux/of.h>
+ #include <linux/relay.h>
+ #include "mt7915.h"
+ #include "eeprom.h"
+@@ -1301,6 +1302,73 @@
+ DEFINE_DEBUGFS_ATTRIBUTE(fops_rf_regval, mt7915_rf_regval_get,
+ 			 mt7915_rf_regval_set, "0x%08llx\n");
+ 
++/* Passive HG5585F status. No firmware messages or diagnostic register writes. */
++static int mt7915_offload_status_show(struct seq_file *s, void *unused)
++{
++	struct mt7915_dev *dev = s->private;
++	struct mt76_dev *mdev = &dev->mt76;
++	bool wed_active = false, wed_airoha = false, wed_running = false;
++	bool wed_quarantined = false, tx_valid = false;
++	u32 tx0 = 0, tx1 = 0, stopped = 0;
++	int q, queues = 0;
++
++	if (mutex_lock_interruptible(&mdev->mutex))
++		return -ERESTARTSYS;
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	wed_active = mtk_wed_device_active(&mdev->mmio.wed);
++	if (wed_active) {
++		struct mtk_wed_device *wed = &mdev->mmio.wed;
++
++		wed_airoha = wed->airoha;
++		wed_running = READ_ONCE(wed->running);
++		wed_quarantined = READ_ONCE(wed->dma_quarantined);
++		/* EN7581 MIBs must not be read when read-clear mode is enabled. */
++		if (wed_airoha && wed_running && !wed_quarantined &&
++		    !test_bit(MT76_RESET, &mdev->phy.state) &&
++		    !(mtk_wed_device_reg_read(wed, 0x00c) & BIT(28))) {
++			tx0 = mtk_wed_device_reg_read(wed, 0x5a0);
++			tx1 = mtk_wed_device_reg_read(wed, 0x5a4);
++			tx_valid = true;
++		}
++	}
++#endif
++	for (q = MT_RXQ_NPU0; q <= MT_RXQ_NPU1; q++) {
++		if (!READ_ONCE(mdev->q_rx[q].ndesc))
++			continue;
++		queues++;
++		if (READ_ONCE(mdev->q_rx[q].stopped))
++			stopped |= BIT(q - MT_RXQ_NPU0);
++	}
++	seq_printf(s, "format: 1\ninstance: %llu\nchip_id: %04x\n",
++		   (unsigned long long)dev->offload_instance, mt76_chip(mdev));
++	seq_printf(s, "expected_rx: %u\nexpected_wed: %u\n",
++		   of_property_present(mdev->dev->of_node, "airoha,hg5585f-rx-offload"),
++		   of_property_present(mdev->dev->of_node, "airoha,wed"));
++	seq_printf(s, "rx_legacy: %u\nrx_configured: %u\nrx_failed: %u\n",
++		   READ_ONCE(mdev->mmio.npu_legacy_rx),
++		   READ_ONCE(dev->npu_legacy_configured), READ_ONCE(dev->npu_legacy_failed));
++	seq_printf(s, "rx_quarantined: %u\nrx_queues: %u\nrx_stopped: %u\n",
++		   READ_ONCE(mdev->mmio.npu_quarantined), queues, stopped);
++	seq_printf(s, "rx_host_packets: %u\nrx_host_errors: %u\n",
++		   (u32)atomic_read(&mdev->mmio.npu_rx_host_packets),
++		   (u32)atomic_read(&mdev->mmio.npu_rx_host_errors));
++	seq_printf(s, "tx_wed: %u\ntx_airoha: %u\ntx_running: %u\n",
++		   wed_active, wed_airoha, wed_running);
++	seq_printf(s, "tx_quarantined: %u\ntx_counters_valid: %u\n",
++		   wed_quarantined, tx_valid);
++	seq_printf(s, "tx_mib0: %u\ntx_mib1: %u\ncounter_bits: 32\n", tx0, tx1);
++	seq_printf(s, "wm_reset_count: %u\nwa_reset_count: %u\nrecovering: %u\n",
++		   READ_ONCE(dev->recovery.wm_reset_count),
++		   READ_ONCE(dev->recovery.wa_reset_count),
++		   test_bit(MT76_RESET, &mdev->phy.state));
++	seq_printf(s, "rx_forwarding: %s\n",
++		   mdev->mmio.npu_legacy_rx ? "linux" : "native");
++	mutex_unlock(&mdev->mutex);
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mt7915_offload_status);
++
+ int mt7915_init_debugfs(struct mt7915_phy *phy)
+ {
+ 	struct mt7915_dev *dev = phy->dev;
+@@ -1309,6 +1377,7 @@
+ 
+ 	dir = mt76_register_debugfs_fops(phy->mt76, NULL);
+ 	mt7915_npu_probe_debugfs(dev, dir);
++	debugfs_create_file("offload_status", 0400, dir, dev, &mt7915_offload_status_fops);
+ 
+ 	debugfs_create_file("muru_debug", 0600, dir, dev, &fops_muru_debug);
+ 	debugfs_create_file("muru_stats", 0400, dir, phy,
+--- a/mt7915/mmio.c
++++ b/mt7915/mmio.c
+@@ -955,6 +955,9 @@
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	dev = container_of(mdev, struct mt7915_dev, mt76);
++	dev->offload_instance = ktime_get_boottime_ns();
++	atomic_set(&mdev->mmio.npu_rx_host_packets, 0);
++	atomic_set(&mdev->mmio.npu_rx_host_errors, 0);
+ 
+ 	ret = mt7915_mmio_init(mdev, mem_base, device_id);
+ 	if (ret)
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -273,6 +273,7 @@
+ 
+ 	struct mt7915_hif *hif2;
+ 	struct mt7915_npu_probe npu_probe;
++	u64 offload_instance;
+ 	bool npu_legacy_failed;
+ 	bool dma_initialized;
+ 	bool npu_legacy_configured;
+--- a/npu.c
++++ b/npu.c
+@@ -158,7 +158,7 @@
+ 	struct mt76_dev *dev = mt76_priv(napi->dev);
+ 	enum mt76_rxq_id qid = napi - dev->napi;
+ 	struct airoha_npu *npu;
+-	int done = 0;
++	int done = 0, errors = 0;
+ 
+ 	rcu_read_lock();
+ 
+@@ -174,6 +174,7 @@
+ 		if (!skb)
+ 			break;
+ 		if (IS_ERR(skb)) {
++			errors++;
+ 			done++;
+ 			continue;
+ 		}
+@@ -184,6 +185,12 @@
+ 	}
+ 
+ 	mt76_npu_fill_rx_queue(dev, &dev->q_rx[qid]);
++	if (dev->mmio.npu_legacy_rx) {
++		if (done != errors)
++			atomic_add(done - errors, &dev->mmio.npu_rx_host_packets);
++		if (errors)
++			atomic_add(errors, &dev->mmio.npu_rx_host_errors);
++	}
+ out:
+ 	if (done < budget && napi_complete(napi) &&
+ 	    (!mt76_queue_is_npu_legacy(&dev->q_rx[qid]) || !dev->q_rx[qid].stopped))

@@ -1,0 +1,59 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] net: airoha: encode and validate HG5585F BAR updates
+
+Map BAR updates to the verified stock wire command 17. Encode single-TID
+BAR state without truncating WCID, TID or sequence number and validate the
+payload before submitting the legacy mailbox.
+
+---
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -534,7 +534,8 @@
+ 		if (wire_id < 0)
+ 			return wire_id;
+ 		if (func_id == WLAN_FUNC_SET_WAIT_DEL_STA ||
+-		    func_id == WLAN_FUNC_SET_WAIT_BA_WIN_SIZE) {
++		    func_id == WLAN_FUNC_SET_WAIT_BA_WIN_SIZE ||
++		    func_id == WLAN_FUNC_SET_WAIT_BAR_INFO) {
+ 			__le32 payload;
+ 			u32 val, encoded;
+ 
+@@ -544,6 +545,9 @@
+ 			val = le32_to_cpu(payload);
+ 			if (func_id == WLAN_FUNC_SET_WAIT_DEL_STA)
+ 				err = airoha_wlan_legacy_sta_encode(val, &encoded);
++			else if (func_id == WLAN_FUNC_SET_WAIT_BAR_INFO)
++				err = airoha_wlan_legacy_bar_encode((val >> 3) & 0xff,
++								    val & 7, val >> 11, &encoded);
+ 			else
+ 				err = airoha_wlan_legacy_ba_encode((val >> 3) & 0xff,
+ 								   val & 7, (val >> 11) & 0x1ff,
+--- a/include/linux/soc/airoha/airoha_wlan_legacy.h
++++ b/include/linux/soc/airoha/airoha_wlan_legacy.h
+@@ -38,6 +38,8 @@
+ 		return 15;
+ 	case WLAN_FUNC_SET_WAIT_ERROR_RETRY_TIMES:
+ 		return 16;
++	case WLAN_FUNC_SET_WAIT_BAR_INFO:
++		return 17;
+ 	case WLAN_FUNC_SET_WAIT_FAST_FLAG:
+ 		return 28;
+ 	default:
+@@ -76,6 +78,17 @@
+ 	    (!window && ssn))
+ 		return -ERANGE;
+ 	*value = (ssn << 20) | (window << 11) | (wcid << 3) | tid;
++
++	return 0;
++}
++
++static inline int
++airoha_wlan_legacy_bar_encode(unsigned int wcid, unsigned int tid,
++			      unsigned int ssn, u32 *value)
++{
++	if (wcid > 255 || tid > 7 || ssn > 4095)
++		return -ERANGE;
++	*value = (ssn << 11) | (wcid << 3) | tid;
+ 
+ 	return 0;
+ }

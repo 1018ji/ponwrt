@@ -1,0 +1,105 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] dt-bindings: net: describe EN7581 WED transmit resources
+
+Describe the WED1/WDMA1 blocks, routed interrupt and PCIe controller.
+Document the wireless consumer links to the WED, PPE and NPU suppliers.
+
+---
+--- /dev/null
++++ b/Documentation/devicetree/bindings/net/airoha,en7581-wed.yaml
+@@ -0,0 +1,64 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/net/airoha,en7581-wed.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Airoha EN7581 Wireless Ethernet Dispatch
++
++maintainers:
++  - PonWrt developers <noreply@localhost>
++
++description: |
++  WED1 and WDMA1 provide the MT7916D transmit path on HG5585F. The primary
++  PCIe HIF references this device with airoha,wed. The PCIe controller is
++  polled by WED for endpoint interrupts. Receive remains on the host.
++
++properties:
++  compatible:
++    const: airoha,en7581-wed
++
++  reg:
++    items:
++      - description: WED1 register block
++      - description: WDMA1 register block
++
++  reg-names:
++    items:
++      - const: wed
++      - const: wdma
++
++  interrupts:
++    maxItems: 1
++
++  airoha,pcie:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description: PCIe controller supplying the MT7916 primary HIF.
++
++required:
++  - compatible
++  - reg
++  - reg-names
++  - interrupts
++  - airoha,pcie
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/interrupt-controller/arm-gic.h>
++
++    soc {
++        #address-cells = <2>;
++        #size-cells = <2>;
++
++        wed@1fa03000 {
++            compatible = "airoha,en7581-wed";
++            reg = <0x0 0x1fa03000 0x0 0xb00>,
++                  <0x0 0x1fa06400 0x0 0x400>;
++            reg-names = "wed", "wdma";
++            interrupt-parent = <&gic>;
++            interrupts = <GIC_SPI 68 IRQ_TYPE_LEVEL_HIGH>;
++            airoha,pcie = <&pcie1>;
++        };
++    };
+--- a/Documentation/devicetree/bindings/net/wireless/mediatek,mt76.yaml
++++ b/Documentation/devicetree/bindings/net/wireless/mediatek,mt76.yaml
+@@ -71,6 +71,18 @@
+     description:
+       Phandle to the infrastructure bus fabric syscon node.
+       This property is MT7622 specific
++
++  airoha,npu:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description: Airoha NPU supplying firmware and optional wireless queues.
++
++  airoha,eth:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description: Airoha Ethernet device supplying PPE flow offload.
++
++  airoha,wed:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description: EN7581 WED transmit provider for the primary PCIe HIF.
+ 
+   ieee80211-freq-limit: true
+ 
+@@ -236,6 +248,9 @@
+       properties:
+         interrupts:
+           maxItems: 1
++
++dependencies:
++  airoha,wed: ["airoha,npu", "airoha,eth"]
+ 
+ unevaluatedProperties: false
+ 

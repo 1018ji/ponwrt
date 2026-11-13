@@ -1,0 +1,409 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] wifi: mt76: add transactional HG5585F host RX backend
+
+Preflight complete stock-format fragment chains before touching packet
+buffers. Copy into one skb, synchronize the persistent DMA mappings back
+to the device, and only then return the descriptors. Keep malformed
+packet drops bounded, wait without consuming incomplete chains, and
+quarantine ownership mismatches.
+
+Dispatch through the NPU RX queue, NAPI and cleanup hooks only when the
+experimental backend is compiled and a queue explicitly uses the legacy
+ABI. The generic NPU initializer still rejects the legacy firmware: chip
+ring, STA/BA and PPE initialization must be implemented before hardware
+activation.
+
+---
+--- a/Makefile
++++ b/Makefile
+@@ -14,6 +14,7 @@
+ 	tx.o agg-rx.o mcu.o wed.o scan.o channel.o
+ 
+ mt76-$(CONFIG_MT76_NPU) += npu.o
++mt76-$(CONFIG_MT76_NPU_LEGACY) += npu_rx_legacy.o
+ mt76-$(CONFIG_PCI) += pci.o
+ mt76-$(CONFIG_NL80211_TESTMODE) += testmode.o
+ 
+--- a/mt76.h
++++ b/mt76.h
+@@ -44,6 +44,7 @@
+ #define MT_QFLAG_WED_RRO_EN	BIT(7)
+ #define MT_QFLAG_EMI_EN		BIT(8)
+ #define MT_QFLAG_NPU		BIT(9)
++#define MT_QFLAG_NPU_LEGACY	BIT(10)
+ 
+ #define __MT_WED_Q(_type, _n)	(MT_QFLAG_WED | \
+ 				 FIELD_PREP(MT_QFLAG_WED_TYPE, _type) | \
+@@ -1689,6 +1690,34 @@
+ int mt76_testmode_set_state(struct mt76_phy *phy, enum mt76_testmode_state state);
+ int mt76_testmode_alloc_skb(struct mt76_phy *phy, u32 len);
+ 
++#ifdef CONFIG_MT76_NPU_LEGACY
++int mt76_npu_legacy_rx_fill(struct mt76_dev *dev, struct mt76_queue *q);
++struct sk_buff *mt76_npu_legacy_rx_dequeue(struct mt76_dev *dev,
++					 struct mt76_queue *q, u32 *info);
++void mt76_npu_legacy_rx_cleanup(struct mt76_dev *dev, struct mt76_queue *q);
++#else
++static inline int mt76_npu_legacy_rx_fill(struct mt76_dev *dev, struct mt76_queue *q)
++{
++	return 0;
++}
++
++static inline struct sk_buff *
++mt76_npu_legacy_rx_dequeue(struct mt76_dev *dev, struct mt76_queue *q, u32 *info)
++{
++	return NULL;
++}
++
++static inline void
++mt76_npu_legacy_rx_cleanup(struct mt76_dev *dev, struct mt76_queue *q)
++{
++}
++#endif
++
++static inline bool mt76_queue_is_npu_legacy(struct mt76_queue *q)
++{
++	return IS_ENABLED(CONFIG_MT76_NPU_LEGACY) && (q->flags & MT_QFLAG_NPU_LEGACY);
++}
++
+ #ifdef CONFIG_MT76_NPU
+ void mt76_npu_check_ppe(struct mt76_dev *dev, struct sk_buff *skb,
+ 			u32 info);
+--- a/npu.c
++++ b/npu.c
+@@ -4,6 +4,7 @@
+  * Author: Lorenzo Bianconi <lorenzo@kernel.org>
+  */
+ #include <linux/kernel.h>
++#include <linux/soc/airoha/airoha_wlan_legacy.h>
+ #include <net/flow_offload.h>
+ #include <net/pkt_cls.h>
+ 
+@@ -17,6 +18,9 @@
+ int mt76_npu_fill_rx_queue(struct mt76_dev *dev, struct mt76_queue *q)
+ {
+ 	int nframes = 0;
++
++	if (mt76_queue_is_npu_legacy(q))
++		return mt76_npu_legacy_rx_fill(dev, q);
+ 
+ 	while (q->queued < q->ndesc - 1) {
+ 		struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
+@@ -46,6 +50,11 @@
+ void mt76_npu_queue_cleanup(struct mt76_dev *dev, struct mt76_queue *q)
+ {
+ 	spin_lock_bh(&q->lock);
++	if (mt76_queue_is_npu_legacy(q)) {
++		mt76_npu_legacy_rx_cleanup(dev, q);
++		spin_unlock_bh(&q->lock);
++		return;
++	}
+ 	while (q->queued > 0) {
+ 		struct mt76_queue_entry *e = &q->entry[q->tail];
+ 
+@@ -66,6 +75,9 @@
+ 	struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
+ 	int i, nframes, index = q->tail;
+ 	struct sk_buff *skb = NULL;
++
++	if (mt76_queue_is_npu_legacy(q))
++		return mt76_npu_legacy_rx_dequeue(dev, q, info);
+ 
+ 	nframes = FIELD_GET(NPU_RX_DMA_PKT_COUNT_MASK, desc[index].info);
+ 	nframes = max_t(int, nframes, 1);
+@@ -161,6 +173,10 @@
+ 		skb = mt76_npu_dequeue(dev, &dev->q_rx[qid], &info);
+ 		if (!skb)
+ 			break;
++		if (IS_ERR(skb)) {
++			done++;
++			continue;
++		}
+ 
+ 		dev->drv->rx_skb(dev, qid, skb, &info);
+ 		mt76_rx_poll_complete(dev, qid, napi);
+@@ -169,7 +185,8 @@
+ 
+ 	mt76_npu_fill_rx_queue(dev, &dev->q_rx[qid]);
+ out:
+-	if (done < budget && napi_complete(napi))
++	if (done < budget && napi_complete(napi) &&
++	    (!mt76_queue_is_npu_legacy(&dev->q_rx[qid]) || !dev->q_rx[qid].stopped))
+ 		dev->drv->rx_poll_complete(dev, qid);
+ 
+ 	rcu_read_unlock();
+@@ -259,26 +276,53 @@
+ {
+ 	int err, irq, qid = q - &dev->q_rx[0];
+ 	int size, index = qid - MT_RXQ_NPU0;
++	bool legacy = false, legacy_queue = false;
+ 	struct airoha_npu *npu;
+ 	const char *name;
+ 
+ 	mutex_lock(&dev->mutex);
+ 
+ 	npu = rcu_dereference_protected(dev->mmio.npu, &dev->mutex);
+-	irq = npu && index < ARRAY_SIZE(npu->irqs) ? npu->irqs[index]
++	irq = npu && index >= 0 && index < ARRAY_SIZE(npu->irqs) ? npu->irqs[index]
+ 						   : -EINVAL;
+ 	if (irq < 0) {
+ 		err = irq;
+ 		goto out;
+ 	}
+ 
++	legacy = npu->wlan_abi == AIROHA_NPU_WLAN_ABI_HG5585F_2024;
++	if (legacy && (!IS_ENABLED(CONFIG_MT76_NPU_LEGACY) || index > 1)) {
++		err = -EOPNOTSUPP;
++		goto out;
++	}
++	if (legacy && dev->dma_dev != npu->dev) {
++		err = -EINVAL;
++		goto out;
++	}
++	if (legacy && q->ndesc) {
++		err = -EBUSY;
++		goto out;
++	}
++	legacy_queue = legacy;
+ 	q->flags = MT_NPU_Q_RX(index);
++	if (legacy)
++		q->flags |= MT_QFLAG_NPU_LEGACY;
+ 	size = qid == MT_RXQ_NPU1 ? NPU_RX1_DESC_NUM : NPU_RX0_DESC_NUM;
++	if (legacy)
++		size = AIROHA_WLAN_LEGACY_RX_DESC_COUNT;
+ 	err = dev->queue_ops->alloc(dev, q, 0, size,
+ 				    MT76_NPU_RX_BUF_SIZE, 0);
+ 	if (err)
+ 		goto out;
+ 
++	if (legacy) {
++		mt76_npu_fill_rx_queue(dev, q);
++		if (q->stopped || q->queued != q->ndesc) {
++			err = -ENOMEM;
++			goto out;
++		}
++	}
++
+ 	name = devm_kasprintf(dev->dev, GFP_KERNEL, "mt76-npu.%d", index);
+ 	if (!name) {
+ 		err = -ENOMEM;
+@@ -291,9 +335,20 @@
+ 		goto out;
+ 
+ 	netif_napi_add(dev->napi_dev, &dev->napi[qid], mt76_npu_rx_poll);
+-	mt76_npu_fill_rx_queue(dev, q);
++	if (!legacy)
++		mt76_npu_fill_rx_queue(dev, q);
+ 	napi_enable(&dev->napi[qid]);
+ out:
++	if (err && legacy_queue) {
++		/* Initialization is called with the host RX DMA engines quiesced. */
++		if (q->desc && q->entry)
++			mt76_npu_legacy_rx_cleanup(dev, q);
++		if (q->page_pool) {
++			page_pool_destroy(q->page_pool);
++			q->page_pool = NULL;
++		}
++		q->ndesc = 0;
++	}
+ 	mutex_unlock(&dev->mutex);
+ 
+ 	return err;
+@@ -456,6 +511,12 @@
+ 		goto error_unlock;
+ 	}
+ 
++	/* Legacy host queues need a separate chip/STA/BA and firmware setup. */
++	if (npu->wlan_abi != AIROHA_NPU_WLAN_ABI_UPSTREAM) {
++		err = -EOPNOTSUPP;
++		goto error_npu_put;
++	}
++
+ 	ppe_dev = airoha_ppe_get_dev(dev->dev);
+ 	if (IS_ERR(ppe_dev)) {
+ 		request_module("airoha-eth");
+--- /dev/null
++++ b/npu_rx_legacy.c
+@@ -0,0 +1,182 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* HG5585F host RX queues. The caller must quiesce DMA before cleanup. */
++#include <linux/soc/airoha/airoha_wlan_legacy.h>
++
++#include "mt76.h"
++#include "dma.h"
++
++int mt76_npu_legacy_rx_fill(struct mt76_dev *dev, struct mt76_queue *q)
++{
++	struct airoha_wlan_legacy_rx_desc *desc = (void *)q->desc;
++	int filled = 0;
++
++	if (q->stopped)
++		return 0;
++
++	/* Stock uses all 256 slots. Keep this initial allocation unpublished until full. */
++	while (q->queued < q->ndesc) {
++		struct mt76_queue_entry *e = &q->entry[q->head];
++		dma_addr_t address;
++		struct page *page;
++		void *buffer;
++		u32 offset;
++
++		if (e->buf) {
++			q->stopped = true;
++			dev_err_ratelimited(dev->dev, "legacy NPU RX refill owns a live slot\n");
++			break;
++		}
++		buffer = mt76_get_page_pool_buf(q, &offset, q->buf_size);
++		if (!buffer)
++			break;
++		page = virt_to_head_page(buffer);
++		address = page_pool_get_dma_addr(page) + offset;
++		if (upper_32_bits(address) ||
++		    upper_32_bits(address + AIROHA_WLAN_LEGACY_RX_BUF_BYTES - 1)) {
++			mt76_put_page_pool_buf(buffer, false);
++			q->stopped = true;
++			dev_err_ratelimited(dev->dev, "legacy NPU RX requires 32-bit DMA\n");
++			break;
++		}
++
++		e->buf = buffer;
++		e->dma_addr[0] = address;
++		e->dma_len[0] = AIROHA_WLAN_LEGACY_RX_BUF_BYTES;
++		memset(&desc[q->head], 0, sizeof(*desc));
++		desc[q->head].dma_addr = cpu_to_le32(address);
++		/* Software owns e->buf. Never trust a firmware-supplied host cookie. */
++		q->head = (q->head + 1) % q->ndesc;
++		q->queued++;
++		filled++;
++	}
++
++	if (filled && q->queued == q->ndesc) {
++		dma_wmb();
++		Q_WRITE(q, dma_idx, q->head);
++	}
++
++	return filled;
++}
++
++static int
++mt76_npu_legacy_rx_peek(struct mt76_queue *q,
++			struct airoha_wlan_legacy_rx_meta *meta)
++{
++	struct airoha_wlan_legacy_rx_desc *desc = (void *)q->desc;
++	unsigned int index = q->tail;
++	int count = 1, i, err;
++
++	for (i = 0; i < count; i++) {
++		struct mt76_queue_entry *e = &q->entry[index];
++		u32 ctrl = le32_to_cpu(READ_ONCE(desc[index].ctrl));
++
++		if (!(ctrl & AIROHA_WLAN_LEGACY_RX_DONE))
++			return -EAGAIN;
++		dma_rmb();
++		if (!e->buf || e->dma_len[0] != AIROHA_WLAN_LEGACY_RX_BUF_BYTES ||
++		    upper_32_bits(e->dma_addr[0]) ||
++		    le32_to_cpu(READ_ONCE(desc[index].dma_addr)) != e->dma_addr[0])
++			return -EIO;
++		err = airoha_wlan_legacy_rx_decode(ctrl,
++			le32_to_cpu(READ_ONCE(desc[index].info)),
++			le32_to_cpu(READ_ONCE(desc[index].data)),
++			AIROHA_WLAN_LEGACY_RX_BUF_BYTES, &meta[i]);
++		if (err)
++			return err;
++		if (!i) {
++			count = meta[0].fragments;
++			if (count > q->queued || count > AIROHA_WLAN_LEGACY_RX_MAX_FRAGS)
++				return -EBADMSG;
++		}
++		index = (index + 1) % q->ndesc;
++	}
++
++	err = airoha_wlan_legacy_rx_chain(meta, count);
++	return err ? err : count;
++}
++
++static void mt76_npu_legacy_rx_retire(struct mt76_dev *dev, struct mt76_queue *q,
++				     unsigned int count, struct sk_buff *skb,
++				     const struct airoha_wlan_legacy_rx_meta *meta)
++{
++	struct airoha_wlan_legacy_rx_desc *desc = (void *)q->desc;
++	unsigned int i;
++
++	for (i = 0; i < count; i++) {
++		struct mt76_queue_entry *e = &q->entry[q->tail];
++
++		dma_sync_single_for_cpu(dev->dma_dev, e->dma_addr[0], e->dma_len[0],
++					page_pool_get_dma_dir(q->page_pool));
++		if (skb)
++			skb_put_data(skb, e->buf, meta[i].length);
++		dma_sync_single_for_device(dev->dma_dev, e->dma_addr[0], e->dma_len[0],
++					   page_pool_get_dma_dir(q->page_pool));
++		/* Copying keeps the page and mapping owned by this queue until stop. */
++		desc[q->tail].info = 0;
++		desc[q->tail].data = 0;
++		desc[q->tail].dma_addr = cpu_to_le32(e->dma_addr[0]);
++		desc[q->tail].software_cookie = 0;
++		dma_wmb();
++		WRITE_ONCE(desc[q->tail].ctrl, 0);
++		q->tail = (q->tail + 1) % q->ndesc;
++	}
++	dma_wmb();
++	Q_WRITE(q, dma_idx, q->tail);
++}
++
++struct sk_buff *mt76_npu_legacy_rx_dequeue(struct mt76_dev *dev,
++					 struct mt76_queue *q, u32 *info)
++{
++	struct airoha_wlan_legacy_rx_meta meta[AIROHA_WLAN_LEGACY_RX_MAX_FRAGS];
++	struct sk_buff *skb;
++	int count;
++
++	if (q->stopped || !q->queued || q->queued != q->ndesc)
++		return NULL;
++
++	count = mt76_npu_legacy_rx_peek(q, meta);
++	if (count == -EAGAIN)
++		return NULL;
++	if (count == -EIO) {
++		/* Preserve buffers and descriptors for teardown after DMA is stopped. */
++		q->stopped = true;
++		dev_err_ratelimited(dev->dev, "legacy NPU RX descriptor ownership mismatch\n");
++		return NULL;
++	}
++	if (count < 0) {
++		mt76_npu_legacy_rx_retire(dev, q, 1, NULL, NULL);
++		return ERR_PTR(count);
++	}
++
++	/* Copy into one linear skb; no partial page ownership passes to mac80211. */
++	skb = napi_alloc_skb(&dev->napi[q - dev->q_rx], meta[0].total);
++	mt76_npu_legacy_rx_retire(dev, q, count, skb, meta);
++	if (!skb)
++		return ERR_PTR(-ENOMEM);
++	*info = meta[0].info;
++	skb_reset_mac_header(skb);
++
++	return skb;
++}
++
++void mt76_npu_legacy_rx_cleanup(struct mt76_dev *dev, struct mt76_queue *q)
++{
++	int i;
++
++	/* No NPU pointer lookup: teardown can already have detached the supplier. */
++	for (i = 0; i < q->ndesc; i++) {
++		struct mt76_queue_entry *e = &q->entry[i];
++
++		if (!e->buf)
++			continue;
++		dma_sync_single_for_cpu(dev->dma_dev, e->dma_addr[0], e->dma_len[0],
++					page_pool_get_dma_dir(q->page_pool));
++		mt76_put_page_pool_buf(e->buf, false);
++		memset(e, 0, sizeof(*e));
++	}
++	memset(q->desc, 0, q->ndesc * AIROHA_WLAN_LEGACY_RX_DESC_BYTES);
++	q->head = 0;
++	q->tail = 0;
++	q->queued = 0;
++	q->stopped = false;
++}

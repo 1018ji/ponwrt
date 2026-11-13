@@ -1,0 +1,771 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] net: airoha: manage HG5585F RX DMA ownership and restart
+
+Own the NPU and independent RX copy GDMA reset resources. Stop request
+producers, wait for the copy channel, and hold both blocks in reset before
+releasing mailbox or descriptor memory. Retain DMA allocations on any
+stop failure. Reload firmware for a new RX owner after a successful stop.
+
+Validate and initialize the exact legacy packet pool and BA node memory.
+Keep the upstream PPE mailbox guard: this receive mode returns frames to
+Linux for forwarding.
+
+---
+--- a/drivers/net/ethernet/airoha/Kconfig
++++ b/drivers/net/ethernet/airoha/Kconfig
+@@ -23,7 +23,8 @@
+ 	  Support the fixed-size WLAN mailbox protocol used by the 2024
+ 	  HG5585F MT7916 firmware. Selection also requires an explicit
+ 	  airoha,wlan-firmware-abi device-tree property and firmware-name.
+-	  This provides protocol diagnostics, not a Wi-Fi data path.
++	  The MT7916 RX frontend requires a separate explicit Wi-Fi overlay.
++	  It returns received frames to Linux for forwarding.
+ 	  Upstream PPE operations are rejected for this firmware ABI.
+ 
+ config NET_AIROHA_WLAN_DIAG
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -12,6 +12,7 @@
+ #include <linux/of_platform.h>
+ #include <linux/of_reserved_mem.h>
+ #include <linux/regmap.h>
++#include <linux/reset.h>
+ 
+ #include "airoha_eth.h"
+ #include <linux/soc/airoha/airoha_wlan_legacy.h>
+@@ -169,6 +170,314 @@
+ 	DECLARE_FLEX_ARRAY(u8, d);
+ };
+ 
++#define LEGACY_GDMA_CTRL0(_n)	(0x8 + ((_n) << 4))
++#define LEGACY_GDMA_BUSY		BIT(1)
++#define LEGACY_RX_COPY_CHANNEL	3
++
++enum airoha_npu_legacy_state {
++	LEGACY_STOPPED,
++	LEGACY_RUNNING,
++	LEGACY_FAULT,
++};
++
++struct airoha_npu_legacy_dma {
++	struct list_head list;
++	void *data;
++	dma_addr_t address;
++	size_t size;
++};
++
++struct airoha_npu_legacy {
++	/* Serializes owner changes, reset state and coherent allocations. */
++	struct mutex lock;
++	struct reset_control *npu_reset;
++	struct reset_control *gdma_reset;
++	struct device *owner;
++	void __iomem *gdma;
++	void __iomem *base;
++	void __iomem *firmware;
++	void __iomem *ba;
++	struct resource region;
++	enum airoha_npu_legacy_state state;
++	bool blocked;
++	int mbox_irq;
++	int wdt_irq[NPU_NUM_CORES];
++	int work_count;
++	struct list_head allocations;
++};
++
++static bool airoha_npu_legacy_blocked(struct airoha_npu *npu)
++{
++	return npu->legacy && READ_ONCE(npu->legacy->blocked);
++}
++
++static int airoha_npu_boot(struct airoha_npu *npu, void __iomem *base,
++			   struct resource *region);
++static int airoha_npu_legacy_stop(struct airoha_npu *npu);
++
++static void airoha_npu_legacy_free_dma(struct airoha_npu *npu)
++{
++	struct airoha_npu_legacy_dma *allocation, *tmp;
++
++	lockdep_assert_held(&npu->legacy->lock);
++	list_for_each_entry_safe(allocation, tmp, &npu->legacy->allocations, list) {
++		dma_free_coherent(npu->dev, allocation->size,
++				  allocation->data, allocation->address);
++		list_del(&allocation->list);
++		kfree(allocation);
++	}
++}
++
++void *airoha_npu_wlan_legacy_alloc(struct airoha_npu *npu, struct device *owner,
++				   size_t size, dma_addr_t *address)
++{
++	struct airoha_npu_legacy *legacy = npu->legacy;
++	struct airoha_npu_legacy_dma *allocation;
++	void *data = NULL;
++
++	if (!legacy || !owner || !size || !address)
++		return NULL;
++	mutex_lock(&legacy->lock);
++	if (legacy->owner != owner || legacy->state == LEGACY_FAULT)
++		goto out;
++	allocation = kzalloc(sizeof(*allocation), GFP_KERNEL);
++	if (!allocation)
++		goto out;
++	data = dma_alloc_coherent(npu->dev, size, address, GFP_KERNEL);
++	if (!data) {
++		kfree(allocation);
++		goto out;
++	}
++	allocation->data = data;
++	allocation->address = *address;
++	allocation->size = size;
++	list_add_tail(&allocation->list, &legacy->allocations);
++out:
++	mutex_unlock(&legacy->lock);
++	return data;
++}
++EXPORT_SYMBOL_GPL(airoha_npu_wlan_legacy_alloc);
++
++void airoha_npu_wlan_legacy_poison(struct airoha_npu *npu, struct device *owner)
++{
++	struct airoha_npu_legacy *legacy = npu->legacy;
++
++	if (!legacy)
++		return;
++	mutex_lock(&legacy->lock);
++	if (legacy->owner == owner) {
++		airoha_npu_legacy_stop(npu);
++		legacy->state = LEGACY_FAULT;
++	}
++	mutex_unlock(&legacy->lock);
++}
++EXPORT_SYMBOL_GPL(airoha_npu_wlan_legacy_poison);
++
++static int airoha_npu_assert_reset(struct reset_control *reset)
++{
++	int state, err;
++
++	err = reset_control_assert(reset);
++	if (err)
++		return err;
++	err = read_poll_timeout(reset_control_status, state, state != 0,
++				100, 10000, false, reset);
++	return state < 0 ? state : err;
++}
++
++static int airoha_npu_legacy_stop(struct airoha_npu *npu)
++{
++	struct airoha_npu_legacy *legacy = npu->legacy;
++	struct airoha_npu_core *core = &npu->cores[0];
++	int err, dma_err, drain_err = 0, i;
++	u32 value;
++
++	lockdep_assert_held(&legacy->lock);
++	if (legacy->state == LEGACY_STOPPED)
++		return 0;
++	if (legacy->state == LEGACY_FAULT) {
++		airoha_npu_assert_reset(legacy->npu_reset);
++		airoha_npu_assert_reset(legacy->gdma_reset);
++		return -EIO;
++	}
++
++	/* Finish any mailbox transaction before preventing all new requests. */
++	spin_lock_bh(&core->lock);
++	WRITE_ONCE(legacy->blocked, true);
++	spin_unlock_bh(&core->lock);
++	if (reset_control_status(legacy->npu_reset) == 0) {
++		regmap_write(npu->regmap, REG_CR_MBOX_INT_STATUS,
++			     MBOX_INT_STATUS_MASK);
++		for (i = 0; i < 2; i++)
++			regmap_clear_bits(npu->regmap, REG_IRQ_RXDONE(i),
++					  NPU_IRQ_RX_MASK(i));
++		for (i = 0; i < NPU_NUM_CORES; i++)
++			regmap_set_bits(npu->regmap, REG_WDT_TIMER_CTRL(i),
++					WDT_INTR_MASK);
++	}
++	if (legacy->mbox_irq >= 0)
++		synchronize_irq(legacy->mbox_irq);
++	for (i = 0; i < ARRAY_SIZE(npu->irqs); i++)
++		if (npu->irqs[i] > 0)
++			synchronize_irq(npu->irqs[i]);
++	for (i = 0; i < legacy->work_count; i++) {
++		if (legacy->wdt_irq[i] >= 0)
++			synchronize_irq(legacy->wdt_irq[i]);
++		cancel_work_sync(&npu->cores[i].wdt_work);
++	}
++
++	/* Stop request producers, drain the independent copy engine, then hold
++	 * both blocks in reset. A timeout never grants permission to free DMA.
++	 */
++	err = airoha_npu_assert_reset(legacy->npu_reset);
++	if (!err)
++		drain_err = readl_poll_timeout(legacy->gdma +
++			LEGACY_GDMA_CTRL0(LEGACY_RX_COPY_CHANNEL), value,
++			!(value & LEGACY_GDMA_BUSY), 10, 100000);
++	dma_err = airoha_npu_assert_reset(legacy->gdma_reset);
++	if (!err)
++		err = drain_err ? drain_err : dma_err;
++	legacy->state = err ? LEGACY_FAULT : LEGACY_STOPPED;
++
++	return err;
++}
++
++int airoha_npu_wlan_legacy_acquire(struct airoha_npu *npu, struct device *owner)
++{
++	struct airoha_npu_legacy *legacy = npu->legacy;
++	int err = 0;
++
++	if (!legacy || !owner)
++		return -EOPNOTSUPP;
++	mutex_lock(&legacy->lock);
++	if (legacy->owner && legacy->owner != owner) {
++		err = -EBUSY;
++		goto out;
++	}
++	if (legacy->state == LEGACY_FAULT) {
++		err = -EIO;
++		goto out;
++	}
++	if (legacy->state == LEGACY_STOPPED) {
++		err = airoha_npu_boot(npu, legacy->base, &legacy->region);
++		if (err) {
++			airoha_npu_legacy_stop(npu);
++			goto out;
++		}
++	}
++	legacy->owner = owner;
++out:
++	mutex_unlock(&legacy->lock);
++	return err;
++}
++EXPORT_SYMBOL_GPL(airoha_npu_wlan_legacy_acquire);
++
++int airoha_npu_wlan_legacy_quiesce(struct airoha_npu *npu, struct device *owner)
++{
++	struct airoha_npu_legacy *legacy = npu->legacy;
++	int err;
++
++	if (!legacy || !owner)
++		return -EOPNOTSUPP;
++	mutex_lock(&legacy->lock);
++	err = legacy->owner == owner ? airoha_npu_legacy_stop(npu) : -EPERM;
++	mutex_unlock(&legacy->lock);
++	return err;
++}
++EXPORT_SYMBOL_GPL(airoha_npu_wlan_legacy_quiesce);
++
++int airoha_npu_wlan_legacy_release(struct airoha_npu *npu, struct device *owner)
++{
++	struct airoha_npu_legacy *legacy = npu->legacy;
++	int err = -EPERM;
++
++	if (!legacy || !owner)
++		return -EOPNOTSUPP;
++	mutex_lock(&legacy->lock);
++	if (legacy->owner == owner) {
++		err = airoha_npu_legacy_stop(npu);
++		if (!err)
++			airoha_npu_legacy_free_dma(npu);
++		if (!err)
++			legacy->owner = NULL;
++	}
++	mutex_unlock(&legacy->lock);
++	return err;
++}
++EXPORT_SYMBOL_GPL(airoha_npu_wlan_legacy_release);
++
++static void airoha_npu_legacy_cleanup(void *data)
++{
++	struct airoha_npu *npu = data;
++	struct airoha_npu_legacy *legacy = npu->legacy;
++	int err, i;
++
++	mutex_lock(&legacy->lock);
++	err = airoha_npu_legacy_stop(npu);
++	mutex_unlock(&legacy->lock);
++	if (err) {
++		/* Keep the mappings and DMA device alive if hardware stop failed. */
++		get_device(npu->dev);
++		dev_err(npu->dev, "legacy NPU stop failed: %d; mailbox DMA retained\n", err);
++		return;
++	}
++	mutex_lock(&legacy->lock);
++	airoha_npu_legacy_free_dma(npu);
++	mutex_unlock(&legacy->lock);
++	for (i = 0; i < NPU_NUM_CORES; i++) {
++		struct airoha_npu_core *core = &npu->cores[i];
++
++		if (core->buf)
++			dma_free_coherent(npu->dev, AIROHA_WLAN_LEGACY_MBOX_SIZE,
++					  core->buf, core->addr);
++	}
++}
++
++static int airoha_npu_legacy_init(struct platform_device *pdev,
++				  struct airoha_npu *npu, void __iomem *base,
++				  struct resource *region)
++{
++	struct airoha_npu_legacy *legacy;
++	struct resource *resource;
++	int i, err;
++
++	if (npu->wlan_abi != AIROHA_NPU_WLAN_ABI_HG5585F_2024)
++		return 0;
++	legacy = devm_kzalloc(npu->dev, sizeof(*legacy), GFP_KERNEL);
++	if (!legacy)
++		return -ENOMEM;
++	mutex_init(&legacy->lock);
++	INIT_LIST_HEAD(&legacy->allocations);
++	legacy->base = base;
++	legacy->region = *region;
++	legacy->blocked = true;
++	legacy->mbox_irq = -1;
++	for (i = 0; i < NPU_NUM_CORES; i++)
++		legacy->wdt_irq[i] = -1;
++	legacy->npu_reset = devm_reset_control_get_exclusive(npu->dev, "npu");
++	if (IS_ERR(legacy->npu_reset))
++		return PTR_ERR(legacy->npu_reset);
++	legacy->gdma_reset = devm_reset_control_get_exclusive(npu->dev, "rx-copy");
++	if (IS_ERR(legacy->gdma_reset))
++		return PTR_ERR(legacy->gdma_reset);
++	resource = platform_get_resource_byname(pdev, IORESOURCE_MEM, "rx-copy");
++	if (!resource || resource->start != 0x1fb30000 ||
++	    resource_size(resource) != 0x2b0)
++		return -EINVAL;
++	legacy->gdma = devm_ioremap_resource(npu->dev, resource);
++	if (IS_ERR(legacy->gdma))
++		return PTR_ERR(legacy->gdma);
++	npu->legacy = legacy;
++	legacy->state = LEGACY_RUNNING;
++	mutex_lock(&legacy->lock);
++	err = airoha_npu_legacy_stop(npu);
++	mutex_unlock(&legacy->lock);
++	if (err)
++		return err;
++	/* Registered before IRQ/work devres: they retire before mailbox memory. */
++	return devm_add_action_or_reset(npu->dev, airoha_npu_legacy_cleanup, npu);
++}
++
+ static int __airoha_npu_send_msg(struct airoha_npu *npu, int func_id,
+ 				 const void *data, int len, void *reply,
+ 				 u16 reply_offset, u16 reply_len)
+@@ -202,7 +511,7 @@
+ 	 */
+ 	spin_lock_bh(&core->lock);
+ 
+-	if (core->legacy_timeout) {
++	if (core->legacy_timeout || airoha_npu_legacy_blocked(npu)) {
+ 		spin_unlock_bh(&core->lock);
+ 		return -EIO;
+ 	}
+@@ -301,10 +610,11 @@
+ 					NPU_EN7581_FIRMWARE_DATA_MAX_SIZE);
+ }
+ 
+-static int airoha_npu_run_firmware(struct device *dev, void __iomem *base,
++static int airoha_npu_run_firmware(struct airoha_npu *npu, void __iomem *base,
+ 				   struct resource *res)
+ {
+ 	const struct airoha_npu_soc_data *soc;
++	struct device *dev = npu->dev;
+ 	void __iomem *addr;
+ 	int ret;
+ 
+@@ -312,9 +622,14 @@
+ 	if (!soc)
+ 		return -EINVAL;
+ 
+-	addr = devm_ioremap_resource(dev, res);
+-	if (IS_ERR(addr))
+-		return PTR_ERR(addr);
++	addr = npu->legacy ? npu->legacy->firmware : NULL;
++	if (!addr) {
++		addr = devm_ioremap_resource(dev, res);
++		if (IS_ERR(addr))
++			return PTR_ERR(addr);
++		if (npu->legacy)
++			npu->legacy->firmware = addr;
++	}
+ 
+ 	/* Try to load firmware images using the firmware names provided via
+ 	 * dts if available.
+@@ -338,6 +653,9 @@
+ {
+ 	struct airoha_npu *npu = npu_instance;
+ 
++	if (airoha_npu_legacy_blocked(npu))
++		return IRQ_NONE;
++
+ 	/* clear mbox interrupt status */
+ 	regmap_write(npu->regmap, REG_CR_MBOX_INT_STATUS,
+ 		     MBOX_INT_STATUS_MASK);
+@@ -359,6 +677,8 @@
+ 
+ 	core = container_of(work, struct airoha_npu_core, wdt_work);
+ 	npu = core->npu;
++	if (airoha_npu_legacy_blocked(npu))
++		return;
+ 
+ 	dump = vzalloc(NPU_DUMP_SIZE);
+ 	if (!dump)
+@@ -378,6 +698,9 @@
+ 	struct airoha_npu *npu = core->npu;
+ 	int c = core - &npu->cores[0];
+ 	u32 val;
++
++	if (airoha_npu_legacy_blocked(npu))
++		return IRQ_NONE;
+ 
+ 	regmap_set_bits(npu->regmap, REG_WDT_TIMER_CTRL(c), WDT_INTR_MASK);
+ 	if (!regmap_read(npu->regmap, REG_WDT_TIMER_CTRL(c), &val) &&
+@@ -631,15 +954,59 @@
+ 					sizeof(val), GFP_KERNEL);
+ }
+ 
++static int airoha_npu_legacy_init_memory(struct airoha_npu *npu)
++{
++	struct resource pkt, ba;
++	void __iomem *area;
++	__le32 value;
++	int index, err;
++
++	index = of_property_match_string(npu->dev->of_node, "memory-region-names", "pkt");
++	if (index < 0)
++		return index;
++	err = of_reserved_mem_region_to_resource(npu->dev->of_node, index, &pkt);
++	if (err)
++		return err;
++	index = of_property_match_string(npu->dev->of_node, "memory-region-names", "ba");
++	if (index < 0)
++		return index;
++	err = of_reserved_mem_region_to_resource(npu->dev->of_node, index, &ba);
++	if (err)
++		return err;
++	err = airoha_wlan_legacy_memory_valid(pkt.start, resource_size(&pkt),
++					      ba.start, resource_size(&ba));
++	if (err)
++		return err;
++	if (resource_overlaps(&pkt, &npu->legacy->region) ||
++	    resource_overlaps(&ba, &npu->legacy->region))
++		return -EINVAL;
++	if (!npu->legacy->ba) {
++		area = devm_ioremap_resource(npu->dev, &ba);
++		if (IS_ERR(area))
++			return PTR_ERR(area);
++		npu->legacy->ba = area;
++	}
++	memset_io(npu->legacy->ba, 0, AIROHA_WLAN_LEGACY_BA_BYTES);
++	/* Reorder nodes must be visible before their address reaches firmware. */
++	wmb();
++	value = cpu_to_le32(pkt.start);
++	err = airoha_npu_wlan_msg_send(npu, 0, WLAN_FUNC_SET_WAIT_PKT_BUF_ADDR,
++				       &value, sizeof(value), GFP_KERNEL);
++	if (err)
++		return err;
++	value = cpu_to_le32(ba.start);
++	return airoha_npu_wlan_msg_send(npu, 0, WLAN_FUNC_SET_WAIT_DRAM_BA_NODE_ADDR,
++				       &value, sizeof(value), GFP_KERNEL);
++}
++
+ static int airoha_npu_wlan_init_memory(struct airoha_npu *npu)
+ {
+ 	enum airoha_npu_wlan_set_cmd cmd = WLAN_FUNC_SET_WAIT_NPU_BAND0_ONCPU;
+ 	u32 val = 0;
+ 	int err;
+ 
+-	/* The stock blob needs its own RX buffer ownership implementation. */
+ 	if (npu->wlan_abi == AIROHA_NPU_WLAN_ABI_HG5585F_2024)
+-		return -EOPNOTSUPP;
++		return airoha_npu_legacy_init_memory(npu);
+ 
+ 	err = airoha_npu_wlan_msg_send(npu, 1, cmd, &val, sizeof(val),
+ 				       GFP_KERNEL);
+@@ -685,6 +1052,8 @@
+ 
+ static void airoha_npu_wlan_irq_status_set(struct airoha_npu *npu, u32 val)
+ {
++	if (airoha_npu_legacy_blocked(npu))
++		return;
+ 	regmap_write(npu->regmap, REG_IRQ_STATUS, val);
+ }
+ 
+@@ -692,17 +1061,23 @@
+ {
+ 	u32 val = 0;
+ 
++	if (airoha_npu_legacy_blocked(npu))
++		return 0;
+ 	regmap_read(npu->regmap, REG_IRQ_STATUS, &val);
+ 	return val & NPU_IRQ_RX_MASK(q);
+ }
+ 
+ static void airoha_npu_wlan_irq_enable(struct airoha_npu *npu, int q)
+ {
++	if (airoha_npu_legacy_blocked(npu))
++		return;
+ 	regmap_set_bits(npu->regmap, REG_IRQ_RXDONE(q), NPU_IRQ_RX_MASK(q));
+ }
+ 
+ static void airoha_npu_wlan_irq_disable(struct airoha_npu *npu, int q)
+ {
++	if (airoha_npu_legacy_blocked(npu))
++		return;
+ 	regmap_clear_bits(npu->regmap, REG_IRQ_RXDONE(q), NPU_IRQ_RX_MASK(q));
+ }
+ 
+@@ -832,7 +1207,59 @@
+ 		return dev_err_probe(dev, -EINVAL, "HG5585F firmware pair mismatch\n");
+ 
+ 	npu->wlan_abi = AIROHA_NPU_WLAN_ABI_HG5585F_2024;
+-	dev_info(dev, "HG5585F WLAN protocol diagnostics; upstream PPE disabled\n");
++	dev_info(dev, "HG5585F WLAN ABI; upstream PPE disabled\n");
++	return 0;
++}
++
++static int airoha_npu_boot(struct airoha_npu *npu, void __iomem *base,
++			   struct resource *region)
++{
++	struct airoha_npu_legacy *legacy = npu->legacy;
++	int i, err;
++
++	if (legacy) {
++		lockdep_assert_held(&legacy->lock);
++		legacy->state = LEGACY_RUNNING;
++		err = reset_control_deassert(legacy->gdma_reset);
++		if (err)
++			return err;
++		/* Discard the verified RX copy channel's state before NPU boot. */
++		for (i = 0; i < 4; i++)
++			writel(0, legacy->gdma + (LEGACY_RX_COPY_CHANNEL << 4) + i * 4);
++		readl(legacy->gdma + LEGACY_GDMA_CTRL0(LEGACY_RX_COPY_CHANNEL));
++		err = reset_control_deassert(legacy->npu_reset);
++		if (err)
++			return err;
++		for (i = 0; i < 2; i++) {
++			regmap_write(npu->regmap, REG_RX_BASE(i), 0);
++			regmap_write(npu->regmap, REG_RX_DSCP_NUM(i), 0);
++			regmap_write(npu->regmap, REG_RX_CPU_IDX(i), 0);
++			regmap_write(npu->regmap, REG_RX_DMA_IDX(i), 0);
++		}
++	}
++	err = airoha_npu_run_firmware(npu, base, region);
++	if (err)
++		return err;
++
++	regmap_write(npu->regmap, REG_CR_NPU_MIB(10),
++		     region->start + NPU_EN7581_FIRMWARE_RV32_MAX_SIZE);
++	regmap_write(npu->regmap, REG_CR_NPU_MIB(11), 0x40000);
++	regmap_write(npu->regmap, REG_CR_NPU_MIB(12), 0);
++	regmap_write(npu->regmap, REG_CR_NPU_MIB(21), 1);
++	msleep(100);
++	for (i = 0; i < NPU_NUM_CORES; i++)
++		regmap_write(npu->regmap, REG_CR_BOOT_BASE(i), region->start);
++	usleep_range(1000, 2000);
++	regmap_write(npu->regmap, REG_CR_BOOT_CONFIG, 0xff);
++	regmap_write(npu->regmap, REG_CR_BOOT_TRIGGER, 0x1);
++	msleep(100);
++	if (legacy) {
++		spin_lock_bh(&npu->cores[0].lock);
++		npu->cores[0].legacy_timeout = false;
++		WRITE_ONCE(legacy->blocked, false);
++		spin_unlock_bh(&npu->cores[0].lock);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -854,6 +1281,10 @@
+ 		return -ENOMEM;
+ 
+ 	npu->dev = dev;
++	for (i = 0; i < NPU_NUM_CORES; i++) {
++		spin_lock_init(&npu->cores[i].lock);
++		npu->cores[i].npu = npu;
++	}
+ 	err = airoha_npu_wlan_select_abi(npu);
+ 	if (err)
+ 		return err;
+@@ -878,6 +1309,9 @@
+ 	err = of_reserved_mem_region_to_resource(dev->of_node, 0, &res);
+ 	if (err)
+ 		return err;
++	err = airoha_npu_legacy_init(pdev, npu, base, &res);
++	if (err)
++		return dev_err_probe(dev, err, "legacy NPU lifecycle resources unavailable\n");
+ 
+ 	irq = platform_get_irq(pdev, 0);
+ 	if (irq < 0)
+@@ -887,12 +1321,11 @@
+ 			       IRQF_SHARED, "airoha-npu-mbox", npu);
+ 	if (err)
+ 		return err;
++	if (npu->legacy)
++		npu->legacy->mbox_irq = irq;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(npu->cores); i++) {
+ 		struct airoha_npu_core *core = &npu->cores[i];
+-
+-		spin_lock_init(&core->lock);
+-		core->npu = npu;
+ 
+ 		irq = platform_get_irq(pdev, i + 1);
+ 		if (irq < 0)
+@@ -902,11 +1335,15 @@
+ 					   airoha_npu_wdt_work);
+ 		if (err)
+ 			return err;
++		if (npu->legacy)
++			npu->legacy->work_count = i + 1;
+ 
+ 		err = devm_request_irq(dev, irq, airoha_npu_wdt_handler,
+ 				       IRQF_SHARED, "airoha-npu-wdt", core);
+ 		if (err)
+ 			return err;
++		if (npu->legacy)
++			npu->legacy->wdt_irq[i] = irq;
+ 	}
+ 
+ 	/* wlan IRQ lines */
+@@ -928,32 +1365,23 @@
+ 		unsigned int capacity = npu->wlan_abi == AIROHA_NPU_WLAN_ABI_HG5585F_2024
+ 			? AIROHA_WLAN_LEGACY_MBOX_SIZE : AIROHA_NPU_MBOX_SIZE;
+ 
+-		core->buf = dmam_alloc_coherent(dev, capacity,
+-						&core->addr, GFP_KERNEL);
++		if (npu->legacy)
++			core->buf = dma_alloc_coherent(dev, capacity,
++						       &core->addr, GFP_KERNEL);
++		else
++			core->buf = dmam_alloc_coherent(dev, capacity,
++							&core->addr, GFP_KERNEL);
+ 		if (!core->buf)
+ 			return -ENOMEM;
+ 	}
+ 
+-	err = airoha_npu_run_firmware(dev, base, &res);
+-	if (err)
+-		return err;
+-
+-	regmap_write(npu->regmap, REG_CR_NPU_MIB(10),
+-		     res.start + NPU_EN7581_FIRMWARE_RV32_MAX_SIZE);
+-	regmap_write(npu->regmap, REG_CR_NPU_MIB(11), 0x40000); /* SRAM 256K */
+-	regmap_write(npu->regmap, REG_CR_NPU_MIB(12), 0);
+-	regmap_write(npu->regmap, REG_CR_NPU_MIB(21), 1);
+-	msleep(100);
+-
+-	/* setting booting address */
+-	for (i = 0; i < NPU_NUM_CORES; i++)
+-		regmap_write(npu->regmap, REG_CR_BOOT_BASE(i), res.start);
+-	usleep_range(1000, 2000);
+-
+-	/* enable NPU cores */
+-	regmap_write(npu->regmap, REG_CR_BOOT_CONFIG, 0xff);
+-	regmap_write(npu->regmap, REG_CR_BOOT_TRIGGER, 0x1);
+-	msleep(100);
++	if (npu->legacy)
++		mutex_lock(&npu->legacy->lock);
++	err = airoha_npu_boot(npu, base, &res);
++	if (npu->legacy)
++		mutex_unlock(&npu->legacy->lock);
++	if (err)
++		return err;
+ 
+ 	if (npu->wlan_abi == AIROHA_NPU_WLAN_ABI_UPSTREAM &&
+ 	    !airoha_npu_wlan_msg_get(npu, 0, WLAN_FUNC_GET_WAIT_NPU_VERSION,
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -170,11 +170,14 @@
+ 	AIROHA_NPU_WLAN_ABI_HG5585F_2024,
+ };
+ 
++struct airoha_npu_legacy;
++
+ struct airoha_npu {
+ #if (IS_BUILTIN(CONFIG_NET_AIROHA_NPU) || IS_MODULE(CONFIG_NET_AIROHA_NPU))
+ 	struct device *dev;
+ 	struct regmap *regmap;
+ 	enum airoha_npu_wlan_abi wlan_abi;
++	struct airoha_npu_legacy *legacy;
+ 
+ 	struct airoha_npu_core {
+ 		struct airoha_npu *npu;
+@@ -223,6 +226,9 @@
+ #if (IS_BUILTIN(CONFIG_NET_AIROHA_NPU) || IS_MODULE(CONFIG_NET_AIROHA_NPU))
+ struct airoha_npu *airoha_npu_get(struct device *dev);
+ void airoha_npu_put(struct airoha_npu *npu);
++void *airoha_npu_wlan_legacy_alloc(struct airoha_npu *npu, struct device *owner,
++				  size_t size, dma_addr_t *address);
++void airoha_npu_wlan_legacy_poison(struct airoha_npu *npu, struct device *owner);
+ 
+ static inline int airoha_npu_wlan_init_reserved_memory(struct airoha_npu *npu)
+ {
+@@ -280,6 +286,18 @@
+ {
+ }
+ 
++static inline void *
++airoha_npu_wlan_legacy_alloc(struct airoha_npu *npu, struct device *owner,
++			      size_t size, dma_addr_t *address)
++{
++	return NULL;
++}
++
++static inline void
++airoha_npu_wlan_legacy_poison(struct airoha_npu *npu, struct device *owner)
++{
++}
++
+ static inline int airoha_npu_wlan_init_reserved_memory(struct airoha_npu *npu)
+ {
+ 	return -EOPNOTSUPP;
+--- a/include/linux/soc/airoha/airoha_wlan_legacy.h
++++ b/include/linux/soc/airoha/airoha_wlan_legacy.h
+@@ -8,6 +8,7 @@
+ #include <linux/errno.h>
+ #include <linux/stddef.h>
+ #include <linux/types.h>
++#include <linux/kconfig.h>
+ #include <linux/soc/airoha/airoha_offload.h>
+ 
+ #define AIROHA_WLAN_LEGACY_MBOX_SIZE	0x1140
+@@ -16,6 +17,33 @@
+ #define AIROHA_WLAN_LEGACY_RX_DESC_COUNT	256
+ #define AIROHA_WLAN_LEGACY_RX_BUF_BYTES	1725
+ #define AIROHA_WLAN_LEGACY_RX_MAX_FRAGS	7
++#define AIROHA_WLAN_LEGACY_INPUT_COUNT	512
++#define AIROHA_WLAN_LEGACY_PKT_COUNT	3000
++#define AIROHA_WLAN_LEGACY_PKT_BYTES	2048
++#define AIROHA_WLAN_LEGACY_BA_BYTES	0x80000
++
++#if IS_ENABLED(CONFIG_NET_AIROHA_NPU)
++int airoha_npu_wlan_legacy_acquire(struct airoha_npu *npu, struct device *owner);
++int airoha_npu_wlan_legacy_quiesce(struct airoha_npu *npu, struct device *owner);
++int airoha_npu_wlan_legacy_release(struct airoha_npu *npu, struct device *owner);
++#endif
++
++static inline int
++airoha_wlan_legacy_memory_valid(u64 pkt, u64 pkt_size, u64 ba, u64 ba_size)
++{
++	u64 pkt_bytes = AIROHA_WLAN_LEGACY_PKT_COUNT * AIROHA_WLAN_LEGACY_PKT_BYTES;
++
++	/* The stock address conversion preserves only the low 30 DRAM bits. */
++	if (pkt < 0x80000000ULL || pkt > 0xc0000000ULL - pkt_bytes ||
++	    ba < 0x80000000ULL || ba > 0xc0000000ULL - AIROHA_WLAN_LEGACY_BA_BYTES ||
++	    (pkt & (AIROHA_WLAN_LEGACY_PKT_BYTES - 1)) || (ba & 7))
++		return -ERANGE;
++	if (pkt_size < pkt_bytes || ba_size < AIROHA_WLAN_LEGACY_BA_BYTES ||
++	    (pkt < ba + AIROHA_WLAN_LEGACY_BA_BYTES && ba < pkt + pkt_bytes))
++		return -EINVAL;
++
++	return 0;
++}
+ 
+ /* Reject unverified commands instead of aliasing the newer enum wholesale. */
+ static inline int airoha_wlan_legacy_set_id(enum airoha_npu_wlan_set_cmd cmd)
+@@ -33,6 +61,7 @@
+ 	case WLAN_FUNC_SET_WAIT_FLUSHONE_TIMEOUT:
+ 	case WLAN_FUNC_SET_WAIT_FLUSHALL_TIMEOUT:
+ 	case WLAN_FUNC_SET_WAIT_IS_FORCE_TO_CPU:
++	case WLAN_FUNC_SET_WAIT_NPU_BAND0_ONCPU:
+ 		return cmd;
+ 	case WLAN_FUNC_SET_WAIT_PCIE_PORT_TYPE:
+ 		return 15;

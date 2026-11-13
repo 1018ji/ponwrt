@@ -1,0 +1,301 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] net: airoha: initialize HG5585F PPE from Linux
+
+Add an explicit host-managed PPE mode for the legacy WLAN firmware.
+Program the observed EN7581 register profile, retain Linux table and port
+configuration, and enable both engines only after verifying DMA geometry.
+Never send modern PPE commands to this firmware. Disable unsupported
+firmware statistics and retain coherent tables on terminal stop failure.
+
+---
+--- a/drivers/net/ethernet/airoha/Kconfig
++++ b/drivers/net/ethernet/airoha/Kconfig
+@@ -60,6 +60,16 @@
+ 	  Retains the upstream NPU firmware for PPE and software Wi-Fi RX.
+ 	  This provider does not support NPU receive offloading.
+ 
++config NET_AIROHA_PPE_HG5585F
++	bool "HG5585F host-managed PPE (experimental)"
++	depends on NET_AIROHA && NET_AIROHA_NPU_HG5585F && EXPERT
++	default n
++	help
++	  Initialize the EN7581 PPE directly from Linux when using the
++	  HG5585F 2024 NPU firmware. Requires airoha,hg5585f-ppe on the
++	  Ethernet controller. Firmware PPE commands and byte counters are
++	  unavailable in this mode. Wi-Fi RX forwarding is selected separately.
++
+ config NET_AIROHA_FLOW_STATS
+ 	default y
+ 	bool "Airoha flow stats"
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -2067,9 +2067,9 @@
+ {
+ 	int i;
+ 
++	airoha_ppe_deinit(eth);
+ 	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++)
+ 		airoha_qdma_cleanup(eth, &eth->qdma[i]);
+-	airoha_ppe_deinit(eth);
+ }
+ 
+ static void airoha_qdma_start_napi(struct airoha_qdma *qdma)
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -728,6 +728,9 @@
+ 
+ struct airoha_ppe {
+ 	bool wed_enabled;
++	bool host_managed;
++	bool host_started;
++	bool host_fault;
+ 	struct airoha_ppe_dev dev;
+ 	struct airoha_eth *eth;
+ 
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -39,7 +39,7 @@
+ 
+ static int airoha_ppe_get_num_stats_entries(struct airoha_ppe *ppe)
+ {
+-	if (!IS_ENABLED(CONFIG_NET_AIROHA_FLOW_STATS))
++	if (ppe->host_managed || !IS_ENABLED(CONFIG_NET_AIROHA_FLOW_STATS))
+ 		return -EOPNOTSUPP;
+ 
+ 	if (airoha_is_7583(ppe->eth))
+@@ -129,7 +129,8 @@
+ 	}
+ 	len += VLAN_ETH_HLEN;
+ 
+-	ppe_id = !airoha_is_lan_gdm_dev(dev) && airoha_ppe_is_enabled(eth, 1);
++	ppe_id = !airoha_is_lan_gdm_dev(dev) &&
++		 (eth->ppe->host_managed || airoha_ppe_is_enabled(eth, 1));
+ 	index = port->id == AIROHA_GDM4_IDX ? 7 : port->id;
+ 	airoha_fe_rmw(eth, REG_PPE_MTU(ppe_id, index),
+ 		      FP_EGRESS_MTU_MASK(index),
+@@ -233,7 +234,7 @@
+ 				continue;
+ 
+ 			ppe_id = !airoha_is_lan_gdm_dev(dev) &&
+-				 airoha_ppe_is_enabled(eth, 1);
++				 (ppe->host_managed || airoha_ppe_is_enabled(eth, 1));
+ 			fport = airoha_get_fe_port(dev);
+ 			airoha_ppe_set_cpu_port(dev, ppe_id, fport);
+ 			airoha_ppe_set_xmit_frame_size(dev);
+@@ -241,6 +242,146 @@
+ 	}
+ 	if (ppe->wed_enabled)
+ 		airoha_ppe_wed_mtu(ppe);
++}
++
++/* Register values observed during the HG5585F 2024 PPE initialization.
++ * Keep DMA addresses, table geometry, hashing, aging and MTUs in hw_init().
++ * This is a host implementation: no legacy firmware PPE command is sent.
++ */
++static void airoha_ppe_host_config(struct airoha_ppe *ppe)
++{
++	static const struct {
++		u16 offset;
++		u32 value;
++	} profile[] = {
++		{ 0x200, 0x00038342 }, /* Disabled global configuration. */
++		{ 0x204, 0x06b9f700 }, /* Flow parser configuration. */
++		{ 0x208, 0x000f000f }, /* Protocol check bitmap. */
++		{ 0x20c, 0x04291106 }, /* Protocol numbers 0..3. */
++		{ 0x210, 0x00003a01 }, /* Protocol numbers 4..7. */
++		{ 0x214, 0 },
++		{ 0x218, 0 },
++		{ 0x21c, 0x08003fb0 }, /* Aging and FIN replacement. */
++		{ 0x22c, 0x0fa00fa0 }, /* Bind limits. */
++		{ 0x230, 0x00011f40 },
++		{ 0x234, 0x01010001 }, /* Keepalive timer. */
++		{ 0x238, 0x03e80003 }, /* Unbound aging. */
++		{ 0x288, 0x001d077f }, /* L2 bridge parser. */
++		{ 0x28c, 0x0000001f }, /* EtherType check bitmap. */
++		{ 0x2d0, 0x88a88100 }, /* VLAN EtherTypes. */
++		{ 0x2d4, 0x08000000 },
++		{ 0x2d8, 0x000086dd },
++	};
++	struct airoha_eth *eth = ppe->eth;
++	int i, j;
++
++	for (i = 0; i < eth->soc->num_ppe; i++) {
++		u32 base = i ? PPE2_BASE : PPE1_BASE;
++
++		for (j = 0; j < ARRAY_SIZE(profile); j++)
++			airoha_fe_wr(eth, base + profile[j].offset,
++				     profile[j].value);
++	}
++}
++
++static int airoha_ppe_host_stop(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++	int i, err = 0;
++	u32 val;
++
++	if (!ppe->host_started)
++		return 0;
++
++	for (i = 0; i < eth->soc->num_ppe; i++) {
++		airoha_fe_wr(eth, REG_PPE_PPE_FLOW_CFG(i), 0);
++		airoha_fe_clear(eth, REG_PPE_GLO_CFG(i), PPE_GLO_CFG_EN_MASK);
++	}
++	for (i = 0; i < eth->soc->num_ppe; i++) {
++		int ret;
++
++		ret = read_poll_timeout(airoha_fe_rr, val,
++					!(val & (PPE_GLO_CFG_BUSY_MASK |
++						PPE_GLO_CFG_EN_MASK)),
++					USEC_PER_MSEC, 100 * USEC_PER_MSEC,
++					false, eth, REG_PPE_GLO_CFG(i));
++		if (ret)
++			err = ret;
++	}
++	if (err)
++		ppe->host_fault = true;
++	else
++		ppe->host_started = false;
++
++	return err;
++}
++
++static int airoha_ppe_host_start(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++	int i;
++
++	if (ppe->host_fault)
++		return -EIO;
++
++	for (i = 0; i < eth->soc->num_ppe; i++)
++		if (airoha_fe_rr(eth, REG_PPE_GLO_CFG(i)) &
++		    (PPE_GLO_CFG_BUSY_MASK | PPE_GLO_CFG_EN_MASK))
++			return -EBUSY;
++
++	ppe->host_started = true;
++	airoha_ppe_host_config(ppe);
++	airoha_ppe_hw_init(ppe);
++
++	for (i = 0; i < eth->soc->num_ppe; i++) {
++		u32 base = ppe->foe_dma +
++			   airoha_ppe_get_total_sram_num_entries(ppe) *
++			   sizeof(struct airoha_foe_entry);
++		u32 cfg = PPE_TB_CFG_SEARCH_MISS_MASK |
++			  FIELD_PREP(PPE_SRAM_TB_NUM_ENTRY_MASK,
++				     PPE_RAM_NUM_ENTRIES_SHIFT(PPE_SRAM_NUM_ENTRIES)) |
++			  FIELD_PREP(PPE_DRAM_TB_NUM_ENTRY_MASK,
++				     PPE_RAM_NUM_ENTRIES_SHIFT(PPE_DRAM_NUM_ENTRIES));
++		u32 mask = PPE_TB_CFG_SEARCH_MISS_MASK |
++			   PPE_SRAM_TB_NUM_ENTRY_MASK | PPE_DRAM_TB_NUM_ENTRY_MASK |
++			   PPE_TB_CFG_KEEPALIVE_MASK | PPE_TB_ENTRY_SIZE_MASK;
++
++		if (airoha_fe_rr(eth, REG_PPE_TB_BASE(i)) != base ||
++		    (airoha_fe_rr(eth, REG_PPE_TB_CFG(i)) & mask) != cfg) {
++			airoha_ppe_host_stop(ppe);
++			return -EIO;
++		}
++	}
++
++	/* Publish tables and all port configuration before enabling either PPE. */
++	dma_wmb();
++	for (i = 0; i < eth->soc->num_ppe; i++)
++		airoha_fe_set(eth, REG_PPE_GLO_CFG(i), PPE_GLO_CFG_EN_MASK);
++
++	for (i = 0; i < eth->soc->num_ppe; i++) {
++		if (!airoha_ppe_is_enabled(eth, i)) {
++			airoha_ppe_host_stop(ppe);
++			return -EIO;
++		}
++	}
++
++	return 0;
++}
++
++static void airoha_ppe_host_free(void *data)
++{
++	struct airoha_ppe *ppe = data;
++	struct airoha_eth *eth = ppe->eth;
++	size_t size = airoha_ppe_get_total_num_entries(ppe) *
++		      sizeof(struct airoha_foe_entry);
++
++	/* A failed stop is terminal, even if a later read happens to look idle. */
++	if (airoha_ppe_host_stop(ppe) || ppe->host_fault) {
++		get_device(eth->dev);
++		dev_err(eth->dev, "PPE stop failed; retaining FOE DMA table\n");
++		return;
++	}
++	dma_free_coherent(eth->dev, size, ppe->foe, ppe->foe_dma);
+ }
+ 
+ static int airoha_ppe_set_wed(struct airoha_ppe_dev *dev, bool enable)
+@@ -1780,6 +1921,17 @@
+ 	if (IS_ERR(npu))
+ 		return PTR_ERR(npu);
+ 
++	if (ppe->host_managed) {
++		if (npu->wlan_abi != AIROHA_NPU_WLAN_ABI_HG5585F_2024) {
++			err = -EPROTONOSUPPORT;
++			goto error_npu_put;
++		}
++		err = airoha_ppe_host_start(ppe);
++		if (err)
++			goto error_npu_put;
++		goto publish;
++	}
++
+ 	err = npu->ops.ppe_init(npu);
+ 	if (err)
+ 		goto error_npu_put;
+@@ -1800,6 +1952,7 @@
+ 	airoha_ppe_hw_init(ppe);
+ 	airoha_ppe_foe_flow_stats_reset(ppe, npu);
+ 
++publish:
+ 	rcu_assign_pointer(eth->npu, npu);
+ 	synchronize_rcu();
+ 
+@@ -1946,14 +2099,29 @@
+ 	ppe->dev.ops.set_wed = airoha_ppe_set_wed;
+ 	ppe->dev.priv = ppe;
+ 	ppe->eth = eth;
++	ppe->host_managed = of_property_read_bool(eth->dev->of_node,
++						  "airoha,hg5585f-ppe");
++	if (ppe->host_managed &&
++	    (!IS_ENABLED(CONFIG_NET_AIROHA_PPE_HG5585F) || !airoha_is_7581(eth)))
++		return -EOPNOTSUPP;
+ 	eth->ppe = ppe;
+ 
+ 	ppe_num_entries = airoha_ppe_get_total_num_entries(ppe);
+ 	foe_size = ppe_num_entries * sizeof(struct airoha_foe_entry);
+-	ppe->foe = dmam_alloc_coherent(eth->dev, foe_size, &ppe->foe_dma,
+-				       GFP_KERNEL);
++	if (ppe->host_managed)
++		ppe->foe = dma_alloc_coherent(eth->dev, foe_size, &ppe->foe_dma,
++					      GFP_KERNEL);
++	else
++		ppe->foe = dmam_alloc_coherent(eth->dev, foe_size, &ppe->foe_dma,
++					       GFP_KERNEL);
+ 	if (!ppe->foe)
+ 		return -ENOMEM;
++
++	if (ppe->host_managed) {
++		err = devm_add_action_or_reset(eth->dev, airoha_ppe_host_free, ppe);
++		if (err)
++			return err;
++	}
+ 
+ 	ppe->foe_flow = devm_kzalloc(eth->dev,
+ 				     ppe_num_entries * sizeof(*ppe->foe_flow),
+@@ -2013,7 +2181,10 @@
+ 				  lockdep_is_held(&flow_offload_mutex));
+ 	if (npu) {
+ 		synchronize_rcu();
+-		npu->ops.ppe_deinit(npu);
++		if (eth->ppe->host_managed)
++			airoha_ppe_host_stop(eth->ppe);
++		else
++			npu->ops.ppe_deinit(npu);
+ 		airoha_npu_put(npu);
+ 	}
+ 

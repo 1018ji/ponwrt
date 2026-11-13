@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+
+/* Register diagnostics with the current firmware. No PCIe IRQ reassignment. */
+&{/soc} {
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	wlan-offload@1fa03000 {
+		compatible = "fiberhome,hg5585f-wlan-offload";
+		reg = <0x0 0x1fa03000 0x0 0xb00>,
+		      <0x0 0x1fa06400 0x0 0x400>;
+		reg-names = "wed", "wdma";
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SPI 68 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "wed";
+		airoha,npu = <&npu>;
+	};
+};

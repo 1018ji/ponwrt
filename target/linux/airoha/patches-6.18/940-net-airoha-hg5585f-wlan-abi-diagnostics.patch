@@ -1,0 +1,456 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] net: airoha: add opt-in HG5585F WLAN ABI diagnostics
+
+Support the verified fixed-size 2024 HG5585F WLAN mailbox subset and
+explicit response offsets. Keep newer PPE calls and memory setup from
+reaching the stock firmware. Add decode helpers for the legacy RX ABI.
+
+This patch provides protocol diagnostics. It does not implement the
+MT7916 RX data path or Airoha WED/WDMA forwarding.
+
+---
+--- a/drivers/net/ethernet/airoha/Kconfig
++++ b/drivers/net/ethernet/airoha/Kconfig
+@@ -15,6 +15,17 @@
+ 	  This driver supports Airoha Network Processor (NPU) available
+ 	  on the Airoha Soc family.
+ 
++config NET_AIROHA_NPU_HG5585F
++	bool "HG5585F 2024 NPU WLAN protocol (experimental)"
++	depends on NET_AIROHA_NPU && EXPERT
++	default n
++	help
++	  Support the fixed-size WLAN mailbox protocol used by the 2024
++	  HG5585F MT7916 firmware. Selection also requires an explicit
++	  airoha,wlan-firmware-abi device-tree property and firmware-name.
++	  This provides protocol diagnostics, not a Wi-Fi data path.
++	  Upstream PPE operations are rejected for this firmware ABI.
++
+ config NET_AIROHA
+ 	tristate "Airoha SoC Gigabit Ethernet support"
+ 	depends on NET_DSA || !NET_DSA
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -14,6 +14,7 @@
+ #include <linux/regmap.h>
+ 
+ #include "airoha_eth.h"
++#include <linux/soc/airoha/airoha_wlan_legacy.h>
+ 
+ #define NPU_EN7581_FIRMWARE_DATA		"airoha/en7581_npu_data.bin"
+ #define NPU_EN7581_FIRMWARE_RV32		"airoha/en7581_npu_rv32.bin"
+@@ -170,16 +171,25 @@
+ 
+ static int __airoha_npu_send_msg(struct airoha_npu *npu, int func_id,
+ 				 const void *data, int len, void *reply,
+-				 u16 reply_len)
++				 u16 reply_offset, u16 reply_len)
+ {
+ 	struct airoha_npu_core *core = &npu->cores[0]; /* FIXME: core */
++	unsigned int capacity;
+ 	u32 val, offset = 0;
+ 	int ret;
+ 
+-	if (len > AIROHA_NPU_MBOX_SIZE)
++	capacity = npu->wlan_abi == AIROHA_NPU_WLAN_ABI_HG5585F_2024
++		? AIROHA_WLAN_LEGACY_MBOX_SIZE : AIROHA_NPU_MBOX_SIZE;
++
++	/* The stock WLAN blob has no verified upstream PPE mailbox ABI. */
++	if (func_id == NPU_FUNC_PPE &&
++	    npu->wlan_abi == AIROHA_NPU_WLAN_ABI_HG5585F_2024)
++		return -EOPNOTSUPP;
++
++	if (len <= 0 || len > capacity)
+ 		return -EINVAL;
+ 
+-	if (reply && reply_len > len)
++	if (reply && (reply_offset > len || reply_len > len - reply_offset))
+ 		return -EINVAL;
+ 
+ 	/*
+@@ -192,14 +202,24 @@
+ 	 */
+ 	spin_lock_bh(&core->lock);
+ 
++	if (core->legacy_timeout) {
++		spin_unlock_bh(&core->lock);
++		return -EIO;
++	}
++
+ 	memcpy(core->buf, data, len);
++	dma_wmb();
+ 
+ 	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(0) + offset, core->addr);
+ 	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(1) + offset, len);
++	val = FIELD_PREP(MBOX_MSG_FUNC_ID, func_id) | MBOX_MSG_WAIT_RSP;
++	if (npu->wlan_abi == AIROHA_NPU_WLAN_ABI_HG5585F_2024)
++		regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(3) + offset, val);
+ 	regmap_read(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, &val);
+ 	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(2) + offset, val + 1);
+ 	val = FIELD_PREP(MBOX_MSG_FUNC_ID, func_id) | MBOX_MSG_WAIT_RSP;
+-	regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(3) + offset, val);
++	if (npu->wlan_abi == AIROHA_NPU_WLAN_ABI_UPSTREAM)
++		regmap_write(npu->regmap, REG_CR_MBQ0_CTRL(3) + offset, val);
+ 
+ 	ret = regmap_read_poll_timeout_atomic(npu->regmap,
+ 					      REG_CR_MBQ0_CTRL(3) + offset,
+@@ -207,10 +227,15 @@
+ 					      100, AIROHA_NPU_MBOX_TIMEOUT_US);
+ 	if (!ret && FIELD_GET(MBOX_MSG_STATUS, val) != NPU_MBOX_SUCCESS)
+ 		ret = -EINVAL;
++	if (ret == -ETIMEDOUT &&
++	    npu->wlan_abi == AIROHA_NPU_WLAN_ABI_HG5585F_2024)
++		core->legacy_timeout = true;
+ 
+-	/* Copy the trailing reply_len bytes of the response. */
+-	if (!ret && reply)
+-		memcpy(reply, core->buf + len - reply_len, reply_len);
++	/* Fixed-size legacy messages return data at +8, not at the tail. */
++	if (!ret && reply) {
++		dma_rmb();
++		memcpy(reply, core->buf + reply_offset, reply_len);
++	}
+ 
+ 	spin_unlock_bh(&core->lock);
+ 
+@@ -225,7 +250,7 @@
+ static int airoha_npu_send_msg(struct airoha_npu *npu, int func_id,
+ 			       void *data, int len)
+ {
+-	return __airoha_npu_send_msg(npu, func_id, data, len, data, len);
++	return __airoha_npu_send_msg(npu, func_id, data, len, data, 0, len);
+ }
+ 
+ static int airoha_npu_load_firmware(struct device *dev, void __iomem *addr,
+@@ -497,17 +522,31 @@
+ 				    void *data, int data_len, gfp_t gfp)
+ {
+ 	struct wlan_mbox_data *wlan_data;
+-	int err, len;
++	int err, len, wire_id = func_id;
++
++	if (ifindex < 0 || ifindex > 15 || data_len < 0 ||
++	    data_len > AIROHA_NPU_MBOX_SIZE - sizeof(*wlan_data) ||
++	    (data_len && !data))
++		return -EINVAL;
++
++	if (npu->wlan_abi == AIROHA_NPU_WLAN_ABI_HG5585F_2024) {
++		wire_id = airoha_wlan_legacy_set_id(func_id);
++		if (wire_id < 0)
++			return wire_id;
++	}
+ 
+ 	len = sizeof(*wlan_data) + data_len;
++	if (npu->wlan_abi == AIROHA_NPU_WLAN_ABI_HG5585F_2024)
++		len = AIROHA_WLAN_LEGACY_MBOX_SIZE;
+ 	wlan_data = kzalloc(len, gfp);
+ 	if (!wlan_data)
+ 		return -ENOMEM;
+ 
+ 	wlan_data->ifindex = ifindex;
+ 	wlan_data->func_type = NPU_OP_SET;
+-	wlan_data->func_id = func_id;
+-	memcpy(wlan_data->d, data, data_len);
++	wlan_data->func_id = wire_id;
++	if (data_len)
++		memcpy(wlan_data->d, data, data_len);
+ 
+ 	err = airoha_npu_send_msg(npu, NPU_FUNC_WIFI, wlan_data, len);
+ 	kfree(wlan_data);
+@@ -520,19 +559,31 @@
+ 				   void *data, int data_len, gfp_t gfp)
+ {
+ 	struct wlan_mbox_data *wlan_data;
+-	int err, len;
++	int err, len, wire_id = func_id;
++
++	if (ifindex < 0 || ifindex > 15 || data_len <= 0 || !data ||
++	    data_len > AIROHA_NPU_MBOX_SIZE - sizeof(*wlan_data))
++		return -EINVAL;
+ 
++	if (npu->wlan_abi == AIROHA_NPU_WLAN_ABI_HG5585F_2024) {
++		wire_id = airoha_wlan_legacy_get_id(func_id);
++		if (wire_id < 0)
++			return wire_id;
++	}
++
+ 	len = sizeof(*wlan_data) + data_len;
++	if (npu->wlan_abi == AIROHA_NPU_WLAN_ABI_HG5585F_2024)
++		len = AIROHA_WLAN_LEGACY_MBOX_SIZE;
+ 	wlan_data = kzalloc(len, gfp);
+ 	if (!wlan_data)
+ 		return -ENOMEM;
+ 
+ 	wlan_data->ifindex = ifindex;
+ 	wlan_data->func_type = NPU_OP_GET;
+-	wlan_data->func_id = func_id;
++	wlan_data->func_id = wire_id;
+ 
+ 	err = __airoha_npu_send_msg(npu, NPU_FUNC_WIFI, wlan_data, len,
+-				    data, data_len);
++				    data, sizeof(*wlan_data), data_len);
+ 	kfree(wlan_data);
+ 
+ 	return err;
+@@ -564,6 +615,10 @@
+ 	u32 val = 0;
+ 	int err;
+ 
++	/* The stock blob needs its own RX buffer ownership implementation. */
++	if (npu->wlan_abi == AIROHA_NPU_WLAN_ABI_HG5585F_2024)
++		return -EOPNOTSUPP;
++
+ 	err = airoha_npu_wlan_msg_send(npu, 1, cmd, &val, sizeof(val),
+ 				       GFP_KERNEL);
+ 	if (err)
+@@ -722,7 +777,43 @@
+ 	.reg_stride		= 4,
+ 	.disable_locking	= true,
+ };
++
++static int airoha_npu_wlan_select_abi(struct airoha_npu *npu)
++{
++	struct device *dev = npu->dev;
++	const char *firmware[2];
++	const char *abi;
++	int err;
++
++	if (!of_property_present(dev->of_node, "airoha,wlan-firmware-abi"))
++		return 0;
++
++	err = of_property_read_string(dev->of_node, "airoha,wlan-firmware-abi", &abi);
++	if (err)
++		return err;
++	if (strcmp(abi, "hg5585f-2024"))
++		return dev_err_probe(dev, -EINVAL, "unknown WLAN firmware ABI: %s\n", abi);
++	if (!IS_ENABLED(CONFIG_NET_AIROHA_NPU_HG5585F))
++		return dev_err_probe(dev, -EOPNOTSUPP,
++				     "HG5585F WLAN protocol is not configured\n");
++	if (!of_device_is_compatible(dev->of_node, "airoha,en7581-npu"))
++		return dev_err_probe(dev, -EINVAL, "HG5585F ABI requires EN7581\n");
++	if (of_property_count_strings(dev->of_node, "firmware-name") != 2)
++		return dev_err_probe(dev, -EINVAL,
++				     "HG5585F ABI requires an explicit firmware pair\n");
++	err = of_property_read_string_array(dev->of_node, "firmware-name",
++					    firmware, ARRAY_SIZE(firmware));
++	if (err != ARRAY_SIZE(firmware))
++		return -EINVAL;
++	if (strcmp(firmware[0], "airoha/hg5585f_npu_rv32.bin") ||
++	    strcmp(firmware[1], "airoha/hg5585f_npu_data.bin"))
++		return dev_err_probe(dev, -EINVAL, "HG5585F firmware pair mismatch\n");
+ 
++	npu->wlan_abi = AIROHA_NPU_WLAN_ABI_HG5585F_2024;
++	dev_info(dev, "HG5585F WLAN protocol diagnostics; upstream PPE disabled\n");
++	return 0;
++}
++
+ static int airoha_npu_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -741,6 +832,9 @@
+ 		return -ENOMEM;
+ 
+ 	npu->dev = dev;
++	err = airoha_npu_wlan_select_abi(npu);
++	if (err)
++		return err;
+ 	npu->ops.ppe_init = airoha_npu_ppe_init;
+ 	npu->ops.ppe_deinit = airoha_npu_ppe_deinit;
+ 	npu->ops.ppe_init_stats = airoha_npu_ppe_stats_setup;
+@@ -809,7 +903,10 @@
+ 	for (i = 0; i < ARRAY_SIZE(npu->cores); i++) {
+ 		struct airoha_npu_core *core = &npu->cores[i];
+ 
+-		core->buf = dmam_alloc_coherent(dev, AIROHA_NPU_MBOX_SIZE,
++		unsigned int capacity = npu->wlan_abi == AIROHA_NPU_WLAN_ABI_HG5585F_2024
++			? AIROHA_WLAN_LEGACY_MBOX_SIZE : AIROHA_NPU_MBOX_SIZE;
++
++		core->buf = dmam_alloc_coherent(dev, capacity,
+ 						&core->addr, GFP_KERNEL);
+ 		if (!core->buf)
+ 			return -ENOMEM;
+@@ -836,7 +933,8 @@
+ 	regmap_write(npu->regmap, REG_CR_BOOT_TRIGGER, 0x1);
+ 	msleep(100);
+ 
+-	if (!airoha_npu_wlan_msg_get(npu, 0, WLAN_FUNC_GET_WAIT_NPU_VERSION,
++	if (npu->wlan_abi == AIROHA_NPU_WLAN_ABI_UPSTREAM &&
++	    !airoha_npu_wlan_msg_get(npu, 0, WLAN_FUNC_GET_WAIT_NPU_VERSION,
+ 				     &val, sizeof(val), GFP_KERNEL))
+ 		dev_info(dev, "NPU fw version: %0d.%d\n",
+ 			 (val >> 16) & 0xffff, val & 0xffff);
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -163,10 +163,16 @@
+ 	WLAN_FUNC_GET_WAIT_NPU_VERSION,
+ };
+ 
++enum airoha_npu_wlan_abi {
++	AIROHA_NPU_WLAN_ABI_UPSTREAM,
++	AIROHA_NPU_WLAN_ABI_HG5585F_2024,
++};
++
+ struct airoha_npu {
+ #if (IS_BUILTIN(CONFIG_NET_AIROHA_NPU) || IS_MODULE(CONFIG_NET_AIROHA_NPU))
+ 	struct device *dev;
+ 	struct regmap *regmap;
++	enum airoha_npu_wlan_abi wlan_abi;
+ 
+ 	struct airoha_npu_core {
+ 		struct airoha_npu *npu;
+@@ -176,6 +182,7 @@
+ 		/* Coherent bounce buffer for mailbox cmd/rsp */
+ 		void *buf;
+ 		dma_addr_t addr;
++		bool legacy_timeout;
+ 	} cores[NPU_NUM_CORES];
+ 
+ 	int irqs[NPU_NUM_IRQ];
+--- /dev/null
++++ b/include/linux/soc/airoha/airoha_wlan_legacy.h
+@@ -0,0 +1,145 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* HG5585F 2024 NPU WLAN ABI, recovered from the stock ARM64 modules. */
++#ifndef __AIROHA_WLAN_LEGACY_H
++#define __AIROHA_WLAN_LEGACY_H
++
++#include <linux/bitfield.h>
++#include <linux/build_bug.h>
++#include <linux/errno.h>
++#include <linux/stddef.h>
++#include <linux/types.h>
++#include <linux/soc/airoha/airoha_offload.h>
++
++#define AIROHA_WLAN_LEGACY_MBOX_SIZE	0x1140
++#define AIROHA_WLAN_MBOX_HEADER_SIZE	8
++#define AIROHA_WLAN_LEGACY_RX_DESC_BYTES	24
++#define AIROHA_WLAN_LEGACY_RX_DESC_COUNT	256
++#define AIROHA_WLAN_LEGACY_RX_BUF_BYTES	1725
++#define AIROHA_WLAN_LEGACY_RX_MAX_FRAGS	7
++
++/* Reject unverified commands instead of aliasing the newer enum wholesale. */
++static inline int airoha_wlan_legacy_set_id(enum airoha_npu_wlan_set_cmd cmd)
++{
++	switch (cmd) {
++	case WLAN_FUNC_SET_WAIT_PCIE_ADDR:
++	case WLAN_FUNC_SET_WAIT_DESC:
++	case WLAN_FUNC_SET_WAIT_TRAN_TO_CPU:
++	case WLAN_FUNC_SET_WAIT_BA_WIN_SIZE:
++	case WLAN_FUNC_SET_WAIT_DRIVER_MODEL:
++	case WLAN_FUNC_SET_WAIT_DRAM_BA_NODE_ADDR:
++	case WLAN_FUNC_SET_WAIT_PKT_BUF_ADDR:
++	case WLAN_FUNC_SET_WAIT_IS_TEST_NOBA:
++	case WLAN_FUNC_SET_WAIT_FLUSHONE_TIMEOUT:
++	case WLAN_FUNC_SET_WAIT_FLUSHALL_TIMEOUT:
++	case WLAN_FUNC_SET_WAIT_IS_FORCE_TO_CPU:
++		return cmd;
++	case WLAN_FUNC_SET_WAIT_PCIE_PORT_TYPE:
++		return 15;
++	case WLAN_FUNC_SET_WAIT_ERROR_RETRY_TIMES:
++		return 16;
++	case WLAN_FUNC_SET_WAIT_FAST_FLAG:
++		return 28;
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++static inline int airoha_wlan_legacy_get_id(enum airoha_npu_wlan_get_cmd cmd)
++{
++	switch (cmd) {
++	case WLAN_FUNC_GET_WAIT_COUNTER:
++	case WLAN_FUNC_GET_WAIT_DBG_COUNTER:
++	case WLAN_FUNC_GET_WAIT_RXDESC_BASE:
++		return cmd;
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++#define AIROHA_WLAN_LEGACY_RX_DONE	BIT(0)
++#define AIROHA_WLAN_LEGACY_RX_LENGTH	GENMASK(13, 1)
++#define AIROHA_WLAN_LEGACY_RX_TOTAL	GENMASK(26, 14)
++#define AIROHA_WLAN_LEGACY_RX_LAST	BIT(27)
++#define AIROHA_WLAN_LEGACY_RX_FRAG_ID	GENMASK(28, 26)
++#define AIROHA_WLAN_LEGACY_RX_FRAG_COUNT	GENMASK(31, 29)
++
++struct airoha_wlan_legacy_rx_desc {
++	__le32 ctrl;
++	__le32 info;
++	__le32 data;
++	__le32 dma_addr;
++	/* Opaque host cookie. Never interpret it as a firmware address. */
++	__le64 software_cookie;
++} __packed;
++
++static_assert(sizeof(struct airoha_wlan_legacy_rx_desc) ==
++	      AIROHA_WLAN_LEGACY_RX_DESC_BYTES);
++static_assert(offsetof(struct airoha_wlan_legacy_rx_desc, dma_addr) == 12);
++static_assert(offsetof(struct airoha_wlan_legacy_rx_desc, software_cookie) == 16);
++
++struct airoha_wlan_legacy_rx_meta {
++	u16 length;
++	u16 total;
++	u8 fragment;
++	u8 fragments;
++	u8 last;
++	u32 info;
++	u32 data;
++};
++
++/* Decode only. The caller still owns the DMA buffer and descriptor. */
++static inline int
++airoha_wlan_legacy_rx_decode(u32 ctrl, u32 info, u32 data, u32 capacity,
++			     struct airoha_wlan_legacy_rx_meta *meta)
++{
++	u16 length, total;
++
++	if (!(ctrl & AIROHA_WLAN_LEGACY_RX_DONE))
++		return -EAGAIN;
++
++	length = FIELD_GET(AIROHA_WLAN_LEGACY_RX_LENGTH, ctrl);
++	total = FIELD_GET(AIROHA_WLAN_LEGACY_RX_TOTAL, ctrl);
++	if (!length || length > capacity || total < length)
++		return -EBADMSG;
++
++	*meta = (struct airoha_wlan_legacy_rx_meta) {
++		.length = length,
++		.total = total,
++		.fragment = FIELD_GET(AIROHA_WLAN_LEGACY_RX_FRAG_ID, info),
++		.fragments = FIELD_GET(AIROHA_WLAN_LEGACY_RX_FRAG_COUNT, info),
++		.last = !!(ctrl & AIROHA_WLAN_LEGACY_RX_LAST),
++		.info = info,
++		.data = data,
++	};
++	if (!meta->fragments)
++		meta->fragments = 1;
++
++	return 0;
++}
++
++/* Validate a completed packet before touching any of its DMA buffers. */
++static inline int
++airoha_wlan_legacy_rx_chain(const struct airoha_wlan_legacy_rx_meta *meta,
++			    unsigned int count)
++{
++	unsigned int i, length = 0;
++
++	if (!count || count > AIROHA_WLAN_LEGACY_RX_MAX_FRAGS ||
++	    meta[0].fragments != count)
++		return -EBADMSG;
++
++	for (i = 0; i < count; i++) {
++		if (!meta[i].length || meta[i].total != meta[0].total ||
++		    meta[i].fragments != count)
++			return -EBADMSG;
++		/* Stock fragment IDs are one-based; standalone packets can use 0. */
++		if (count > 1 &&
++		    (meta[i].fragment != i + 1 || meta[i].last != (i == count - 1)))
++			return -EBADMSG;
++		length += meta[i].length;
++	}
++
++	return length == meta[0].total ? 0 : -EBADMSG;
++}
++
++#endif

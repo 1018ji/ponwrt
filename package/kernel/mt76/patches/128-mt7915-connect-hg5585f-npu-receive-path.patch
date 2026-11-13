@@ -1,0 +1,786 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] wifi: mt76: mt7915: connect HG5585F NPU receive and reorder
+
+Connect the opt-in legacy firmware to MT7916 input and host return rings.
+Use the verified 512-entry input geometry, physical band and PCIe mapping.
+Preserve native transmit and MCU/event queues, and return received frames
+to Linux instead of using the incompatible upstream PPE firmware ABI.
+
+Give coherent descriptors to the supplier until a verified stop; keep all
+DMA memory on failure. Disable native data polling for firmware-owned
+queues, handle probe unwind, and restart the MAC and NPU together so BA
+state is re-established after recovery.
+
+---
+--- a/dma.c
++++ b/dma.c
+@@ -222,7 +222,8 @@
+ 			  bool reset_idx)
+ {
+ 	/* Legacy hostadpt rings are published only after IRQ/NAPI setup. */
+-	if (!q || !q->ndesc || mt76_queue_is_npu_legacy(q))
++	if (!q || !q->ndesc || mt76_queue_is_npu_legacy(q) ||
++	    (q->flags & MT_QFLAG_NPU_INPUT))
+ 		return;
+ 
+ 	if (!mt76_queue_is_wed_rro_ind(q) &&
+@@ -687,7 +688,7 @@
+ 		goto free_skb;
+ 
+ 	/* TODO: Take into account unlinear skbs */
+-	if (mt76_npu_device_active(dev) && skb_linearize(skb))
++	if (mt76_queue_is_npu_tx(q) && skb_linearize(skb))
+ 		goto free_skb;
+ 
+ 	t = mt76_get_txwi(dev);
+@@ -739,7 +740,7 @@
+ 	if (ret < 0)
+ 		goto unmap;
+ 
+-	if (mt76_npu_device_active(dev))
++	if (mt76_queue_is_npu_tx(q))
+ 		return mt76_npu_dma_add_buf(phy, q, skb, &tx_info.buf[1], txwi);
+ 
+ 	return mt76_dma_add_buf(dev, q, tx_info.buf, tx_info.nbuf,
+@@ -841,6 +842,8 @@
+ 	q->buf_size = bufsize;
+ 	q->hw_idx = idx;
+ 	q->dev = dev;
++	if (q->flags & MT_QFLAG_NPU_INPUT)
++		return 0;
+ 
+ 	if (mt76_queue_is_wed_rro_ind(q))
+ 		size = sizeof(struct mt76_wed_rro_desc);
+@@ -851,8 +854,18 @@
+ 	else
+ 		size = sizeof(struct mt76_desc);
+ 
+-	q->desc = dmam_alloc_coherent(dev->dma_dev, q->ndesc * size,
+-				      &q->desc_dma, GFP_KERNEL);
++#ifdef CONFIG_MT76_NPU_LEGACY
++	if (dev->mmio.npu_legacy_rx) {
++		struct airoha_npu *npu = rcu_dereference_protected(dev->mmio.npu, 1);
++
++		q->desc = airoha_npu_wlan_legacy_alloc(npu, dev->dev,
++						      q->ndesc * size, &q->desc_dma);
++	} else
++#endif
++	{
++		q->desc = dmam_alloc_coherent(dev->dma_dev, q->ndesc * size,
++					      &q->desc_dma, GFP_KERNEL);
++	}
+ 	if (!q->desc)
+ 		return -ENOMEM;
+ 
+@@ -891,7 +904,7 @@
+ 	void *buf;
+ 	bool more;
+ 
+-	if (!q->ndesc)
++	if (!q->ndesc || (q->flags & MT_QFLAG_NPU_INPUT))
+ 		return;
+ 
+ 	if (mt76_queue_is_npu(q)) {
+@@ -936,6 +949,11 @@
+ 
+ 	if (!q->ndesc)
+ 		return;
++	if (mt76_queue_is_npu_legacy(q)) {
++		/* The chip restarts the supplier before publishing these rings. */
++		mt76_npu_legacy_rx_cleanup(dev, q);
++		return;
++	}
+ 
+ 	if (!mt76_queue_is_wed_rro_ind(q) &&
+ 	    !mt76_queue_is_wed_rro_rxdmad_c(q) && !mt76_queue_is_npu(q)) {
+@@ -1166,6 +1184,8 @@
+ 
+ 	mt76_for_each_q_rx(dev, i) {
+ 		if (mt76_queue_is_wed_rro(&dev->q_rx[i]))
++			continue;
++		if (mt76_queue_is_npu_legacy(&dev->q_rx[i]))
+ 			continue;
+ 
+ 		mt76_dma_rx_queue_init(dev, i, poll);
+@@ -1199,6 +1219,8 @@
+ 		mtk_wed_device_quiesce(&dev->mmio.wed);
+ 	int i;
+ 
++	quarantine |= dev->mmio.npu_quarantined;
++
+ 	mt76_worker_disable(&dev->tx_worker);
+ 	napi_disable(&dev->tx_napi);
+ 	netif_napi_del(&dev->tx_napi);
+@@ -1223,10 +1245,12 @@
+ 	mt76_for_each_q_rx(dev, i) {
+ 		struct mt76_queue *q = &dev->q_rx[i];
+ 
++		mt76_npu_legacy_free_irq(dev, q);
+ 		netif_napi_del(&dev->napi[i]);
+ 		mt76_dma_rx_cleanup(dev, q);
+ 
+ 		page_pool_destroy(q->page_pool);
++		q->page_pool = NULL;
+ 	}
+ 
+ detach:
+@@ -1237,8 +1261,10 @@
+ 		mtk_wed_device_detach(&dev->mmio.wed_hif2);
+ 
+ 	if (quarantine) {
+-		mt76_for_each_q_rx(dev, i)
++		mt76_for_each_q_rx(dev, i) {
++			mt76_npu_legacy_free_irq(dev, &dev->q_rx[i]);
+ 			netif_napi_del(&dev->napi[i]);
++		}
+ 		goto free_napi;
+ 	}
+ 
+--- a/mt76.h
++++ b/mt76.h
+@@ -45,6 +45,7 @@
+ #define MT_QFLAG_EMI_EN		BIT(8)
+ #define MT_QFLAG_NPU		BIT(9)
+ #define MT_QFLAG_NPU_LEGACY	BIT(10)
++#define MT_QFLAG_NPU_INPUT	BIT(11)
+ 
+ #define __MT_WED_Q(_type, _n)	(MT_QFLAG_WED | \
+ 				 FIELD_PREP(MT_QFLAG_WED_TYPE, _type) | \
+@@ -737,6 +738,8 @@
+ 	struct airoha_npu __rcu *npu;
+ 	phys_addr_t phy_addr;
+ 	int npu_type;
++	bool npu_legacy_rx;
++	bool npu_quarantined;
+ };
+ 
+ struct mt76_rx_status {
+@@ -1302,7 +1305,8 @@
+ 
+ #define mt76_for_each_q_rx(dev, i)	\
+ 	for (i = 0; i < ARRAY_SIZE((dev)->q_rx); i++)	\
+-		if ((dev)->q_rx[i].ndesc)
++		if ((dev)->q_rx[i].ndesc && \
++		    !((dev)->q_rx[i].flags & MT_QFLAG_NPU_INPUT))
+ 
+ 
+ #define mt76_dereference(p, dev) \
+@@ -1696,7 +1700,19 @@
+ struct sk_buff *mt76_npu_legacy_rx_dequeue(struct mt76_dev *dev,
+ 					 struct mt76_queue *q, u32 *info);
+ void mt76_npu_legacy_rx_cleanup(struct mt76_dev *dev, struct mt76_queue *q);
++int mt76_npu_legacy_init(struct mt76_dev *dev, phys_addr_t address);
++void mt76_npu_legacy_free_irq(struct mt76_dev *dev, struct mt76_queue *q);
+ #else
++static inline int mt76_npu_legacy_init(struct mt76_dev *dev, phys_addr_t address)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline void mt76_npu_legacy_free_irq(struct mt76_dev *dev,
++					  struct mt76_queue *q)
++{
++}
++
+ static inline int mt76_npu_legacy_rx_publish(struct mt76_queue *q)
+ {
+ 	return -EOPNOTSUPP;
+--- a/mt7915/dma.c
++++ b/mt7915/dma.c
+@@ -257,6 +257,8 @@
+ 	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
+ 	int err;
+ 
++	if (dev->mt76.mmio.npu_legacy_rx)
++		return mt7915_npu_legacy_quiesce(dev);
+ 	if (!mtk_wed_device_active(wed))
+ 		return 0;
+ 	err = mtk_wed_device_quiesce(wed);
+@@ -295,6 +297,14 @@
+ 	u32 hif1_ofs = 0;
+ 	u32 irq_mask;
+ 
++	if (mdev->mmio.npu_legacy_rx) {
++		if (mdev->mmio.npu_quarantined || !dev->npu_legacy_configured)
++			return -EIO;
++		pci_set_master(to_pci_dev(mdev->dev));
++		if (dev->hif2)
++			pci_set_master(to_pci_dev(dev->hif2->dev));
++	}
++
+ #ifdef CONFIG_NET_AIROHA_WED
+ 	if (mtk_wed_device_active(&mdev->mmio.wed) && mdev->mmio.wed.airoha) {
+ 		if (mdev->mmio.wed.dma_quarantined)
+@@ -352,6 +362,12 @@
+ 
+ 	if (dev->dbdc_support || dev->phy.mt76->band_idx)
+ 		irq_mask |= MT_INT_BAND1_RX_DONE;
++	if (mdev->mmio.npu_legacy_rx) {
++		if (mdev->q_rx[MT_RXQ_MAIN].flags & MT_QFLAG_NPU_INPUT)
++			irq_mask &= ~MT_INT_RX(MT_RXQ_MAIN);
++		if (mdev->q_rx[MT_RXQ_BAND1].flags & MT_QFLAG_NPU_INPUT)
++			irq_mask &= ~MT_INT_RX(MT_RXQ_BAND1);
++	}
+ 
+ 	if (mtk_wed_device_active(&dev->mt76.mmio.wed) && wed_reset) {
+ 		u32 wed_irq_mask = irq_mask;
+@@ -561,6 +577,8 @@
+ 
+ 	/* rx data queue for band0 */
+ 	if (!dev->phy.mt76->band_idx) {
++		if (mdev->mmio.npu_legacy_rx)
++			mdev->q_rx[MT_RXQ_MAIN].flags = MT_QFLAG_NPU_INPUT;
+ 		if (mtk_wed_device_active(&mdev->mmio.wed) &&
+ 		    mtk_wed_get_rx_capa(&mdev->mmio.wed)) {
+ 			mdev->q_rx[MT_RXQ_MAIN].flags =
+@@ -571,7 +589,8 @@
+ 
+ 		ret = mt76_queue_alloc(dev, &dev->mt76.q_rx[MT_RXQ_MAIN],
+ 				       MT_RXQ_ID(MT_RXQ_MAIN),
+-				       MT7915_RX_RING_SIZE,
++				       mdev->mmio.npu_legacy_rx ?
++				       MT7915_NPU_RX_RING_SIZE : MT7915_RX_RING_SIZE,
+ 				       MT_RX_BUF_SIZE,
+ 				       MT_RXQ_RING_BASE(MT_RXQ_MAIN));
+ 		if (ret)
+@@ -600,6 +619,8 @@
+ 	}
+ 
+ 	if (dev->dbdc_support || dev->phy.mt76->band_idx) {
++		if (mdev->mmio.npu_legacy_rx)
++			mdev->q_rx[MT_RXQ_BAND1].flags = MT_QFLAG_NPU_INPUT;
+ 		if (mtk_wed_device_active(&mdev->mmio.wed) &&
+ 		    mtk_wed_get_rx_capa(&mdev->mmio.wed)) {
+ 			mdev->q_rx[MT_RXQ_BAND1].flags =
+@@ -611,7 +632,8 @@
+ 		/* rx data queue for band1 */
+ 		ret = mt76_queue_alloc(dev, &dev->mt76.q_rx[MT_RXQ_BAND1],
+ 				       MT_RXQ_ID(MT_RXQ_BAND1),
+-				       MT7915_RX_RING_SIZE,
++				       mdev->mmio.npu_legacy_rx ?
++				       MT7915_NPU_RX_RING_SIZE : MT7915_RX_RING_SIZE,
+ 				       MT_RX_BUF_SIZE,
+ 				       MT_RXQ_RING_BASE(MT_RXQ_BAND1) + hif1_ofs);
+ 		if (ret)
+@@ -634,6 +656,12 @@
+ 	netif_napi_add_tx(dev->mt76.tx_napi_dev, &dev->mt76.tx_napi,
+ 			  mt7915_poll_tx);
+ 	napi_enable(&dev->mt76.tx_napi);
++	if (mdev->mmio.npu_legacy_rx) {
++		dev->npu_legacy_dma_ready = true;
++		ret = mt7915_npu_legacy_rx_setup(dev, true);
++		if (ret)
++			return ret;
++	}
+ 
+ 	return mt7915_dma_enable(dev, false);
+ }
+@@ -644,7 +672,7 @@
+ 	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
+ 	int i, err;
+ 
+-	if (mtk_wed_device_active(wed)) {
++	if (mtk_wed_device_active(wed) || dev->mt76.mmio.npu_legacy_rx) {
+ 		err = mt7915_dma_quiesce(dev);
+ 		if (err)
+ 			return err;
+@@ -699,6 +727,11 @@
+ 		mt76_rmw(dev, MT_WFDMA0_EXT0_CFG, MT_WFDMA0_EXT0_RXWB_KEEP,
+ 			 MT_WFDMA0_EXT0_RXWB_KEEP);
+ 
++	if (dev->mt76.mmio.npu_legacy_rx) {
++		err = mt7915_npu_legacy_rx_setup(dev, false);
++		if (err)
++			return err;
++	}
+ 	return mt7915_dma_enable(dev, !force);
+ }
+ 
+@@ -708,4 +741,5 @@
+ 	mt7915_dma_disable(dev, true);
+ 
+ 	mt76_dma_cleanup(&dev->mt76);
+-}
++	dev->npu_legacy_dma_ready = false;
++}
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -1289,7 +1289,8 @@
+ 			napi_disable(&dev->mt76.napi[i]);
+ 	}
+ 	mt7915_mcu_exit(dev);
+-	if (!mtk_wed_device_active(&dev->mt76.mmio.wed) ||
++	if ((!mtk_wed_device_active(&dev->mt76.mmio.wed) &&
++	     !dev->mt76.mmio.npu_legacy_rx) ||
+ 	    !mt7915_dma_quiesce(dev))
+ 		mt76_connac2_tx_token_put(&dev->mt76);
+ 	mt7915_dma_cleanup(dev);
+@@ -1381,6 +1382,11 @@
+ 
+ void mt7915_unregister_device(struct mt7915_dev *dev)
+ {
++	if (dev->mt76.mmio.npu_legacy_rx) {
++		dev->recovery.hw_init_done = false;
++		/* Finish any NAPI mailbox failure before cancelling reset work. */
++		synchronize_rcu();
++	}
+ 	cancel_work_sync(&dev->dump_work);
+ 	cancel_work_sync(&dev->reset_work);
+ 	cancel_work_sync(&dev->rc_work);
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1375,7 +1375,7 @@
+ 	ext_phy = dev->mt76.phys[MT_BAND1];
+ 	phy2 = ext_phy ? ext_phy->priv : NULL;
+ 
+-	if (mtk_wed_device_active(&mdev->mmio.wed)) {
++	if (mtk_wed_device_active(&mdev->mmio.wed) || mdev->mmio.npu_legacy_rx) {
+ 		ret = mt7915_dma_quiesce(dev);
+ 		if (ret) {
+ 			dev->recovery.wed_failed = true;
+@@ -1600,7 +1600,11 @@
+ 	phy2 = ext_phy ? ext_phy->priv : NULL;
+ 
+ 	/* chip full reset */
+-	if (dev->recovery.restart) {
++	/* Restart the MAC state too: a rebooted NPU has no prior BA sessions. */
++	if (dev->recovery.restart ||
++	    (dev->mt76.mmio.npu_legacy_rx &&
++	     (READ_ONCE(dev->npu_legacy_failed) ||
++	      (READ_ONCE(dev->recovery.state) & MT_MCU_CMD_STOP_DMA)))) {
+ 		/* disable WA/WM WDT */
+ 		mt76_clear(dev, MT_WFDMA0_MCU_HOST_INT_ENA,
+ 			   MT_MCU_CMD_WDT_MASK);
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -24,6 +24,7 @@
+ #define MT7915_TX_FWDL_RING_SIZE	128
+ 
+ #define MT7915_RX_RING_SIZE		1536
++#define MT7915_NPU_RX_RING_SIZE		512
+ #define MT7915_RX_MCU_RING_SIZE		512
+ 
+ #define MT7915_FIRMWARE_WA		"mediatek/mt7915_wa.bin"
+@@ -273,6 +274,8 @@
+ 	struct mt7915_hif *hif2;
+ 	struct mt7915_npu_probe npu_probe;
+ 	bool npu_legacy_failed;
++	bool npu_legacy_dma_ready;
++	bool npu_legacy_configured;
+ 	struct mt7915_reg_desc reg;
+ 	u8 q_id[MT7915_MAX_QUEUE];
+ 	u32 q_int_mask[MT7915_MAX_QUEUE];
+@@ -674,6 +677,10 @@
+ int mt7915_mcu_muru_debug_get(struct mt7915_phy *phy);
+ int mt7915_mcu_wed_enable_rx_stats(struct mt7915_dev *dev);
+ #ifdef CONFIG_MT76_NPU_LEGACY
++int mt7915_npu_legacy_init(struct mt7915_dev *dev);
++int mt7915_npu_legacy_rx_setup(struct mt7915_dev *dev, bool initial);
++int mt7915_npu_legacy_quiesce(struct mt7915_dev *dev);
++void mt7915_npu_legacy_cleanup(struct mt7915_dev *dev);
+ bool mt7915_npu_legacy_active(struct mt7915_dev *dev);
+ int mt7915_npu_legacy_sta_reset(struct mt7915_dev *dev, unsigned int band,
+ 				 unsigned int wcid);
+@@ -683,6 +690,25 @@
+ 			   const struct sk_buff *skb);
+ bool mt7915_npu_legacy_poll_complete(struct mt76_dev *dev, enum mt76_rxq_id q);
+ #else
++static inline int mt7915_npu_legacy_init(struct mt7915_dev *dev)
++{
++	return 0;
++}
++
++static inline int mt7915_npu_legacy_rx_setup(struct mt7915_dev *dev, bool initial)
++{
++	return 0;
++}
++
++static inline int mt7915_npu_legacy_quiesce(struct mt7915_dev *dev)
++{
++	return 0;
++}
++
++static inline void mt7915_npu_legacy_cleanup(struct mt7915_dev *dev)
++{
++}
++
+ static inline bool mt7915_npu_legacy_active(struct mt7915_dev *dev)
+ {
+ 	return false;
+--- a/mt7915/npu_legacy.c
++++ b/mt7915/npu_legacy.c
+@@ -1,8 +1,12 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* HG5585F MT7916 receive-side state synchronization. */
+ #include <linux/soc/airoha/airoha_wlan_legacy.h>
++#include <linux/of.h>
+ 
+ #include "mt7915.h"
++#include "../dma.h"
++
++static_assert(MT7915_NPU_RX_RING_SIZE == AIROHA_WLAN_LEGACY_INPUT_COUNT);
+ 
+ static bool mt7915_npu_is_legacy(struct airoha_npu *npu)
+ {
+@@ -35,6 +39,8 @@
+ 	/* Descriptor/page ownership stays with the queues until DMA is quiesced. */
+ 	dev_err_ratelimited(dev->mt76.dev, "legacy NPU state synchronization failed: %d\n",
+ 			    error);
++	if (dev->recovery.hw_init_done)
++		queue_work(dev->mt76.wq, &dev->reset_work);
+ }
+ 
+ static int mt7915_npu_legacy_send(struct mt7915_dev *dev, unsigned int band,
+@@ -142,3 +148,195 @@
+ 	/* NPU queue IDs must never index the chip's native interrupt map. */
+ 	return true;
+ }
++
++int mt7915_npu_legacy_init(struct mt7915_dev *dev)
++{
++	struct pci_dev *pdev;
++
++	if (!of_property_present(dev->mt76.dev->of_node, "airoha,hg5585f-rx-offload"))
++		return 0;
++	if (!is_mt7916(&dev->mt76) || !dev_is_pci(dev->mt76.dev) ||
++	    of_property_present(dev->mt76.dev->of_node, "airoha,wed"))
++		return -EOPNOTSUPP;
++	pdev = to_pci_dev(dev->mt76.dev);
++	return mt76_npu_legacy_init(&dev->mt76, pci_resource_start(pdev, 0));
++}
++
++int mt7915_npu_legacy_quiesce(struct mt7915_dev *dev)
++{
++	struct mt76_dev *mdev = &dev->mt76;
++	struct airoha_npu *npu;
++	u32 offset = dev->hif2 ? MT_WFDMA0_PCIE1(0) - MT_WFDMA0(0) : 0;
++	u32 busy = BIT(1) | BIT(3);
++	int q, err = 0, stop_err;
++
++	if (!mdev->mmio.npu_legacy_rx)
++		return 0;
++	if (mdev->mmio.npu_quarantined)
++		return -EIO;
++	mt7915_irq_disable(dev, ~0);
++	for (q = MT_RXQ_NPU0; q <= MT_RXQ_NPU1; q++)
++		WRITE_ONCE(mdev->q_rx[q].stopped, true);
++	mt76_npu_disable_irqs(mdev);
++	mt76_clear(dev, MT_WFDMA0_GLO_CFG,
++		   MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN);
++	if (dev->hif2)
++		mt76_clear(dev, MT_WFDMA0_GLO_CFG + offset,
++			   MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN);
++	if (!mt76_poll_msec(dev, MT_WFDMA0_GLO_CFG, busy, 0, 100))
++		err = -ETIMEDOUT;
++	if (dev->hif2 &&
++	    !mt76_poll_msec(dev, MT_WFDMA0_GLO_CFG + offset, busy, 0, 100))
++		err = -ETIMEDOUT;
++	pci_clear_master(to_pci_dev(mdev->dev));
++	if (dev->hif2)
++		pci_clear_master(to_pci_dev(dev->hif2->dev));
++	npu = rcu_dereference_protected(mdev->mmio.npu, 1);
++	stop_err = npu ? airoha_npu_wlan_legacy_quiesce(npu, mdev->dev) : -ENODEV;
++	if (!err)
++		err = stop_err;
++	if (err) {
++		if (npu)
++			airoha_npu_wlan_legacy_poison(npu, mdev->dev);
++		WRITE_ONCE(dev->npu_legacy_failed, true);
++		mdev->mmio.npu_quarantined = true;
++		dev_err(mdev->dev, "legacy NPU DMA stop failed: %d; memory retained\n", err);
++	}
++	dev->npu_legacy_configured = false;
++	return err;
++}
++
++static int mt7915_npu_legacy_port_type(struct mt7915_dev *dev)
++{
++	int primary = pci_domain_nr(to_pci_dev(dev->mt76.dev)->bus);
++
++	if (primary > 1)
++		return -EOPNOTSUPP;
++	if (dev->hif2) {
++		int secondary = pci_domain_nr(to_pci_dev(dev->hif2->dev)->bus);
++
++		if (secondary > 1 || secondary == primary)
++			return -EOPNOTSUPP;
++		/* Stock 2 maps band0/band1 to PCIe0/1; 3 reverses that mapping. */
++		return primary ? 3 : 2;
++	}
++	return primary;
++}
++
++int mt7915_npu_legacy_rx_setup(struct mt7915_dev *dev, bool initial)
++{
++	struct mt76_dev *mdev = &dev->mt76;
++	struct airoha_npu *npu;
++	int band, type, err;
++
++	if (!mdev->mmio.npu_legacy_rx)
++		return 0;
++	if (mdev->mmio.npu_quarantined)
++		return -EIO;
++	npu = rcu_dereference_protected(mdev->mmio.npu, 1);
++	if (!npu)
++		return -ENODEV;
++	if (!initial) {
++		err = airoha_npu_wlan_legacy_acquire(npu, mdev->dev);
++		if (err)
++			return err;
++		err = airoha_npu_wlan_init_reserved_memory(npu);
++		if (err)
++			return err;
++	}
++	WRITE_ONCE(dev->npu_legacy_failed, false);
++	type = mt7915_npu_legacy_port_type(dev);
++	if (type < 0)
++		return type;
++	err = mt7915_npu_legacy_send(dev, 0, WLAN_FUNC_SET_WAIT_DRIVER_MODEL, 2);
++	if (err)
++		return err;
++	err = mt7915_npu_legacy_send(dev, 0, WLAN_FUNC_SET_WAIT_PCIE_PORT_TYPE, type);
++	if (err)
++		return err;
++	/* This receive mode reorders in NPU and returns every frame to Linux. */
++	err = mt7915_npu_legacy_send(dev, 0, WLAN_FUNC_SET_WAIT_IS_FORCE_TO_CPU, 1);
++	if (err)
++		return err;
++	err = mt7915_npu_legacy_send(dev, 1, WLAN_FUNC_SET_WAIT_NPU_BAND0_ONCPU, 0);
++	if (err)
++		return err;
++	for (band = 0; band < 2; band++) {
++		struct mt76_queue *input = &mdev->q_rx[band ? MT_RXQ_BAND1 : MT_RXQ_MAIN];
++		struct mt76_queue *host = &mdev->q_rx[MT_RXQ_NPU0 + band];
++		u32 base;
++		u64 offset, address;
++
++		if (!(input->flags & MT_QFLAG_NPU_INPUT))
++			continue;
++		offset = (u8 __iomem *)input->regs - (u8 __iomem *)mdev->mmio.regs;
++		address = mdev->mmio.phy_addr + offset;
++		if (upper_32_bits(address) ||
++		    offset + sizeof(*input->regs) >
++		    pci_resource_len(to_pci_dev(mdev->dev), 0))
++			return -ERANGE;
++		err = mt7915_npu_legacy_send(dev, band, WLAN_FUNC_SET_WAIT_PCIE_ADDR, address);
++		if (err)
++			return err;
++		err = mt7915_npu_legacy_send(dev, band, WLAN_FUNC_SET_WAIT_DESC,
++					     AIROHA_WLAN_LEGACY_INPUT_COUNT);
++		if (err)
++			return err;
++		err = mt76_npu_get_msg(npu, band, WLAN_FUNC_GET_WAIT_RXDESC_BASE,
++				       &base, GFP_KERNEL);
++		if (err)
++			return err;
++		if ((base & 15) || base < 0x1e800000 ||
++		    base > 0x1e878000 - AIROHA_WLAN_LEGACY_INPUT_COUNT * 16)
++			return -ERANGE;
++		if (initial) {
++			err = mt76_npu_rx_queue_init(mdev, host);
++		} else {
++			host->stopped = false;
++			mt76_npu_legacy_rx_fill(mdev, host);
++			err = mt76_npu_legacy_rx_publish(host);
++		}
++		if (err)
++			return err;
++		writel(base, &input->regs->desc_base);
++		writel(AIROHA_WLAN_LEGACY_INPUT_COUNT, &input->regs->ring_size);
++		writel(AIROHA_WLAN_LEGACY_INPUT_COUNT - 1, &input->regs->cpu_idx);
++		writel(0, &input->regs->dma_idx);
++	}
++	dev->npu_legacy_configured = true;
++	/* Recovery callers schedule each host NAPI after enabling it again. */
++	if (initial) {
++		for (band = 0; band < 2; band++)
++			if (mdev->q_rx[MT_RXQ_NPU0 + band].ndesc)
++				airoha_npu_wlan_enable_irq(npu, band);
++	}
++	return 0;
++}
++
++void mt7915_npu_legacy_cleanup(struct mt7915_dev *dev)
++{
++	int q;
++
++	if (!dev->mt76.mmio.npu_legacy_rx)
++		return;
++	if (dev->recovery.hw_init_done) {
++		dev->recovery.hw_init_done = false;
++		synchronize_rcu();
++		cancel_work_sync(&dev->reset_work);
++	}
++	if (!dev->npu_legacy_dma_ready) {
++		if (!mt7915_npu_legacy_quiesce(dev)) {
++			/* Probe failed before NAPI could fill these native queues. */
++			mt76_for_each_q_rx(&dev->mt76, q) {
++				if (dev->mt76.q_rx[q].page_pool) {
++					page_pool_destroy(dev->mt76.q_rx[q].page_pool);
++					dev->mt76.q_rx[q].page_pool = NULL;
++				}
++			}
++		}
++		return;
++	}
++	mt76_for_each_q_rx(&dev->mt76, q)
++		napi_disable(&dev->mt76.napi[q]);
++	mt7915_dma_cleanup(dev);
++}
+--- a/mt7915/npu_probe.c
++++ b/mt7915/npu_probe.c
+@@ -79,7 +79,10 @@
+ 		seq_printf(s, "legacy_rx_buf_bytes: %u\n",
+ 			   AIROHA_WLAN_LEGACY_RX_BUF_BYTES);
+ 	}
+-	seq_puts(s, "rx_offload: disabled\ntx_offload: disabled\n");
++	seq_printf(s, "rx_offload: %s\n",
++		   READ_ONCE(dev->npu_legacy_configured) &&
++		   !READ_ONCE(dev->npu_legacy_failed) ? "legacy (Linux forwarding)" : "disabled");
++	seq_puts(s, "tx_offload: disabled\n");
+ 	return 0;
+ }
+ DEFINE_SHOW_ATTRIBUTE(mt7915_npu_probe);
+--- a/mt7915/pci.c
++++ b/mt7915/pci.c
+@@ -136,6 +136,9 @@
+ 	mdev = &dev->mt76;
+ 	mt7915_wfsys_reset(dev);
+ 	mt7915_npu_probe(dev);
++	ret = mt7915_npu_legacy_init(dev);
++	if (ret)
++		goto free_device;
+ 
+ 	ret = mt7915_mmio_wed_init(dev, pdev, true, &irq);
+ 	if (ret < 0)
+@@ -199,6 +202,7 @@
+ 	else
+ 		pci_free_irq_vectors(pdev);
+ free_device:
++	mt7915_npu_legacy_cleanup(dev);
+ 	mt76_free_device(&dev->mt76);
+ 
+ 	return ret;
+--- a/npu.c
++++ b/npu.c
+@@ -381,7 +381,7 @@
+ 			page_pool_destroy(q->page_pool);
+ 			q->page_pool = NULL;
+ 		}
+-		if (q->desc)
++		if (q->desc && !dev->mmio.npu_legacy_rx)
+ 			dmam_free_coherent(dev->dma_dev,
+ 				q->ndesc * AIROHA_WLAN_LEGACY_RX_DESC_BYTES,
+ 				q->desc, q->desc_dma);
+@@ -533,6 +533,61 @@
+ }
+ EXPORT_SYMBOL_GPL(mt76_npu_disable_irqs);
+ 
++#ifdef CONFIG_MT76_NPU_LEGACY
++int mt76_npu_legacy_init(struct mt76_dev *dev, phys_addr_t address)
++{
++	struct airoha_npu *npu;
++	int err;
++
++	npu = airoha_npu_get(dev->dev);
++	if (IS_ERR(npu)) {
++		request_module("airoha-npu");
++		npu = airoha_npu_get(dev->dev);
++	}
++	if (IS_ERR(npu))
++		return PTR_ERR(npu);
++	if (!npu)
++		return -EOPNOTSUPP;
++	if (npu->wlan_abi != AIROHA_NPU_WLAN_ABI_HG5585F_2024 ||
++	    upper_32_bits(address)) {
++		err = -EOPNOTSUPP;
++		goto put;
++	}
++	err = airoha_npu_wlan_legacy_acquire(npu, dev->dev);
++	if (err)
++		goto put;
++	err = airoha_npu_wlan_init_reserved_memory(npu);
++	if (err) {
++		/* A failed stop retains the supplier and every DMA mapping. */
++		if (airoha_npu_wlan_legacy_release(npu, dev->dev))
++			return err;
++		goto put;
++	}
++	dev->dma_dev = npu->dev;
++	dev->mmio.phy_addr = address;
++	dev->mmio.npu_legacy_rx = true;
++	rcu_assign_pointer(dev->mmio.npu, npu);
++	return 0;
++put:
++	airoha_npu_put(npu);
++	return err;
++}
++EXPORT_SYMBOL_GPL(mt76_npu_legacy_init);
++
++void mt76_npu_legacy_free_irq(struct mt76_dev *dev, struct mt76_queue *q)
++{
++	struct airoha_npu *npu;
++	int index = q - dev->q_rx - MT_RXQ_NPU0;
++
++	if (!mt76_queue_is_npu_legacy(q))
++		return;
++	npu = rcu_dereference_protected(dev->mmio.npu, 1);
++	if (npu && index >= 0 && index < 2)
++		devm_free_irq(dev->dev, npu->irqs[index], q);
++}
++EXPORT_SYMBOL_GPL(mt76_npu_legacy_free_irq);
++#endif
++
+ int mt76_npu_init(struct mt76_dev *dev, phys_addr_t phy_addr, int type)
+ {
+ 	struct airoha_ppe_dev *ppe_dev;
+@@ -608,11 +663,28 @@
+ 
+ 	npu = rcu_replace_pointer(dev->mmio.npu, NULL,
+ 				  lockdep_is_held(&dev->mutex));
++	ppe_dev = rcu_replace_pointer(dev->mmio.ppe_dev, NULL,
++				      lockdep_is_held(&dev->mutex));
++	synchronize_rcu();
++	if (!npu && !ppe_dev) {
++		mutex_unlock(&dev->mutex);
++		return;
++	}
++	if (dev->mmio.npu_legacy_rx) {
++		int err;
++
++		if (npu) {
++			err = airoha_npu_wlan_legacy_release(npu, dev->dev);
++			if (!err && !dev->mmio.npu_quarantined)
++				airoha_npu_put(npu);
++		}
++		if (ppe_dev)
++			airoha_ppe_put_dev(ppe_dev);
++		mutex_unlock(&dev->mutex);
++		return;
++	}
+ 	if (npu)
+ 		airoha_npu_put(npu);
+-
+-	ppe_dev = rcu_replace_pointer(dev->mmio.ppe_dev, NULL,
+-				      lockdep_is_held(&dev->mutex));
+ 	if (ppe_dev)
+ 		airoha_ppe_put_dev(ppe_dev);
+ 
+--- a/npu_rx_legacy.c
++++ b/npu_rx_legacy.c
+@@ -52,6 +52,7 @@
+ 
+ 	return filled;
+ }
++EXPORT_SYMBOL_GPL(mt76_npu_legacy_rx_fill);
+ 
+ int mt76_npu_legacy_rx_publish(struct mt76_queue *q)
+ {
+@@ -77,6 +78,7 @@
+ 
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(mt76_npu_legacy_rx_publish);
+ 
+ static int mt76_npu_legacy_rx_available(struct mt76_queue *q)
+ {

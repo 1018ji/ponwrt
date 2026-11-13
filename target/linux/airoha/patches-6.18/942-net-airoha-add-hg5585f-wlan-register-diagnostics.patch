@@ -1,0 +1,242 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] net: airoha: add HG5585F WLAN register diagnostics
+
+Expose an audited WED1/WDMA1 register whitelist and the NPU host RX ring
+registers through read-only debugfs files. Describe the primary HIF WED1
+resources separately from the stock firmware ABI overlay.
+
+Keep this driver opt-in. It never writes registers, requests the WED IRQ,
+reads descriptor memory, or enables an offload data path.
+
+---
+--- a/drivers/net/ethernet/airoha/Kconfig
++++ b/drivers/net/ethernet/airoha/Kconfig
+@@ -26,6 +26,16 @@
+ 	  This provides protocol diagnostics, not a Wi-Fi data path.
+ 	  Upstream PPE operations are rejected for this firmware ABI.
+ 
++config NET_AIROHA_WLAN_DIAG
++	bool "HG5585F WED1/WDMA1 register diagnostics (experimental)"
++	depends on NET_AIROHA_NPU=y && DEBUG_FS && OF
++	default n
++	help
++	  Expose read-only WED1/WDMA1 and NPU host RX queue status through
++	  debugfs when the HG5585F WLAN diagnostic device-tree node exists.
++	  No interrupt handler is installed and no registers are written.
++	  This driver does not implement Wi-Fi hardware offloading.
++
+ config NET_AIROHA
+ 	tristate "Airoha SoC Gigabit Ethernet support"
+ 	depends on NET_DSA || !NET_DSA
+--- a/drivers/net/ethernet/airoha/Makefile
++++ b/drivers/net/ethernet/airoha/Makefile
+@@ -7,3 +7,4 @@
+ airoha-eth-y := airoha_eth.o airoha_ppe.o
+ airoha-eth-$(CONFIG_DEBUG_FS) += airoha_ppe_debugfs.o
+ obj-$(CONFIG_NET_AIROHA_NPU) += airoha_npu.o
++obj-$(CONFIG_NET_AIROHA_WLAN_DIAG) += airoha_wlan_diag.o
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_wlan_diag.c
+@@ -0,0 +1,202 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* EN7581 WLAN offload register diagnostics. No DMA or IRQ ownership changes. */
++#include <linux/debugfs.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/seq_file.h>
++#include <linux/soc/airoha/airoha_offload.h>
++
++/* Read whitelist recovered from HG5585F mt_whnat_7916.ko status callbacks. */
++static const struct debugfs_reg32 airoha_wed_regs[] = {
++	{ "WED_REV", 0x000 },
++	{ "WED_CTRL", 0x00c },
++	{ "WED_CTRL2", 0x01c },
++	{ "WED_EX_INT_STA", 0x020 },
++	{ "WED_EX_INT_MSK", 0x028 },
++	{ "WED_GLO_CFG", 0x208 },
++	{ "WED_INT_MSK", 0x204 },
++	{ "WED_TX_FREE_TO_TX_BM_TKID_MIB", 0x1c0 },
++	{ "WED_TX_BM_TO_WDMA_RX_DRV_TKID_MIB", 0x1c4 },
++	{ "WED_PCIE_CFG_BASE", 0x560 },
++	{ "WED_WPDMA_CFG_BASE", 0x580 },
++	{ "WED_WDMA_CFG_BASE", 0xaa0 },
++	{ "WED_TX0_MIB", 0x2a0 },
++	{ "WED_TX1_MIB", 0x2a4 },
++	{ "WED_TX0_BASE", 0x300 },
++	{ "WED_TX0_CNT", 0x304 },
++	{ "WED_TX0_CIDX", 0x308 },
++	{ "WED_TX0_DIDX", 0x30c },
++	{ "WED_TX1_BASE", 0x310 },
++	{ "WED_TX1_CNT", 0x314 },
++	{ "WED_TX1_CIDX", 0x318 },
++	{ "WED_TX1_DIDX", 0x31c },
++	{ "WED_WPDMA_TX0_MIB", 0x5a0 },
++	{ "WED_WPDMA_TX1_MIB", 0x5a4 },
++	{ "WED_WPDMA_TX1_BASE", 0x610 },
++	{ "WED_WPDMA_TX1_CNT", 0x614 },
++	{ "WED_WPDMA_TX1_CIDX", 0x618 },
++	{ "WED_WPDMA_TX1_DIDX", 0x61c },
++	{ "WED_WPDMA_TX1_COHERENT_MIB", 0x5d4 },
++	{ "WED_WDMA_RX0_MIB", 0xae0 },
++	{ "WED_WDMA_RX1_MIB", 0xae4 },
++	{ "WED_WDMA_RX1_BASE", 0x910 },
++	{ "WED_WDMA_RX1_CNT", 0x914 },
++	{ "WED_WDMA_RX1_CRX_IDX", 0x918 },
++	{ "WED_WDMA_RX1_DRX_IDX", 0x91c },
++	{ "WED_WDMA_RX1_PROCESSED_MIB", 0xaf4 },
++	{ "WED_RX1_MIB", 0x2e4 },
++	{ "WED_RX1_BASE", 0x410 },
++	{ "WED_RX1_CNT", 0x414 },
++	{ "WED_RX1_CIDX", 0x418 },
++	{ "WED_RX1_DIDX", 0x41c },
++	{ "WED_WPDMA_RX1_MIB", 0x5e4 },
++	{ "WED_WPDMA_RX1_COHERENT_MIB", 0x5f0 },
++	{ "WED_WPDMA_RX1_EXTC_FREE_TKID_MIB", 0x5f8 },
++};
++
++static const struct debugfs_reg32 airoha_wdma_regs[] = {
++	{ "WDMA_INFO", 0x200 },
++	{ "WDMA_GLO_CFG", 0x204 },
++	{ "WDMA_INT_MSK", 0x228 },
++	{ "WDMA_RX_BASE_PTR_0", 0x100 },
++	{ "WDMA_RX_MAX_CNT_0", 0x104 },
++	{ "WDMA_RX_CRX_IDX_0", 0x108 },
++	{ "WDMA_RX_DRX_IDX_0", 0x10c },
++	{ "WDMA_RX_BASE_PTR_1", 0x110 },
++	{ "WDMA_RX_MAX_CNT_1", 0x114 },
++	{ "WDMA_RX_CRX_IDX_1", 0x118 },
++	{ "WDMA_RX_DRX_IDX_1", 0x11c },
++};
++
++#define AIROHA_NPU_HOST_RX_BASE(q)	(0x30d180 + (q) * 0x10)
++
++struct airoha_wlan_diag {
++	struct airoha_npu *npu;
++	struct debugfs_regset32 wed;
++	struct debugfs_regset32 wdma;
++	int irq;
++};
++
++static int airoha_wlan_diag_status_show(struct seq_file *s, void *unused)
++{
++	static const char * const fields[] = { "base", "count", "dma_idx", "cpu_idx" };
++	struct airoha_wlan_diag *diag = s->private;
++	int q, i, err;
++	u32 value;
++
++	seq_printf(s, "npu_abi: %u\nwed_irq: %d\n", diag->npu->wlan_abi, diag->irq);
++	seq_puts(s, "mode: registers-only\nirq_handler: none\n");
++	seq_puts(s, "offload_enabled_by_diagnostics: no\n");
++	/* Live register reads are not an atomic snapshot. No descriptors are read. */
++	for (q = 0; q < 2; q++) {
++		seq_printf(s, "host_rx_%d_irq: %d\n", q, diag->npu->irqs[q]);
++		for (i = 0; i < ARRAY_SIZE(fields); i++) {
++			err = regmap_read(diag->npu->regmap,
++					  AIROHA_NPU_HOST_RX_BASE(q) + 4 * i, &value);
++			if (err)
++				return err;
++			seq_printf(s, "host_rx_%d_%s: %08x\n", q, fields[i], value);
++		}
++	}
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(airoha_wlan_diag_status);
++
++static void airoha_wlan_diag_put_npu(void *data)
++{
++	airoha_npu_put(data);
++}
++
++static void airoha_wlan_diag_remove_debugfs(void *data)
++{
++	debugfs_remove_recursive(data);
++}
++
++static int airoha_wlan_diag_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct airoha_wlan_diag *diag;
++	struct dentry *dir;
++	struct resource *res;
++	const char *name;
++	int err;
++
++	diag = devm_kzalloc(dev, sizeof(*diag), GFP_KERNEL);
++	if (!diag)
++		return -ENOMEM;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "wed");
++	if (!res || res->start != 0x1fa03000 || resource_size(res) != 0xb00)
++		return dev_err_probe(dev, -EINVAL, "expected HG5585F WED1 resource\n");
++	diag->wed.base = devm_ioremap_resource(dev, res);
++	if (IS_ERR(diag->wed.base))
++		return PTR_ERR(diag->wed.base);
++	diag->wed.regs = airoha_wed_regs;
++	diag->wed.nregs = ARRAY_SIZE(airoha_wed_regs);
++	diag->wed.dev = dev;
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "wdma");
++	if (!res || res->start != 0x1fa06400 || resource_size(res) != 0x400)
++		return dev_err_probe(dev, -EINVAL, "expected HG5585F WDMA1 resource\n");
++	diag->wdma.base = devm_ioremap_resource(dev, res);
++	if (IS_ERR(diag->wdma.base))
++		return PTR_ERR(diag->wdma.base);
++	diag->wdma.regs = airoha_wdma_regs;
++	diag->wdma.nregs = ARRAY_SIZE(airoha_wdma_regs);
++	diag->wdma.dev = dev;
++
++	/* Describe the routed line for comparison; do not request or reroute it. */
++	diag->irq = platform_get_irq_byname(pdev, "wed");
++	if (diag->irq < 0)
++		return diag->irq;
++
++	diag->npu = airoha_npu_get(dev);
++	if (IS_ERR(diag->npu)) {
++		err = PTR_ERR(diag->npu);
++		if (err == -ENODEV)
++			err = -EPROBE_DEFER;
++		return dev_err_probe(dev, err, "NPU supplier unavailable\n");
++	}
++	err = devm_add_action_or_reset(dev, airoha_wlan_diag_put_npu, diag->npu);
++	if (err)
++		return err;
++
++	name = devm_kasprintf(dev, GFP_KERNEL, "airoha-wlan-%s", dev_name(dev));
++	if (!name)
++		return -ENOMEM;
++	dir = debugfs_create_dir(name, NULL);
++	if (IS_ERR(dir))
++		return PTR_ERR(dir);
++	err = devm_add_action_or_reset(dev, airoha_wlan_diag_remove_debugfs, dir);
++	if (err)
++		return err;
++
++	debugfs_create_file("status", 0400, dir, diag, &airoha_wlan_diag_status_fops);
++	debugfs_create_regset32("wed", 0400, dir, &diag->wed);
++	debugfs_create_regset32("wdma", 0400, dir, &diag->wdma);
++	dev_info(dev, "WED1/WDMA1 register diagnostics available in debugfs\n");
++
++	return 0;
++}
++
++static const struct of_device_id airoha_wlan_diag_of_match[] = {
++	{ .compatible = "fiberhome,hg5585f-wlan-offload" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, airoha_wlan_diag_of_match);
++
++static struct platform_driver airoha_wlan_diag_driver = {
++	.probe = airoha_wlan_diag_probe,
++	.driver = {
++		.name = "airoha-wlan-diag",
++		.of_match_table = airoha_wlan_diag_of_match,
++	},
++};
++module_platform_driver(airoha_wlan_diag_driver);
++
++MODULE_DESCRIPTION("HG5585F WLAN offload register diagnostics");
++MODULE_LICENSE("GPL");

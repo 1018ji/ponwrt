@@ -1,0 +1,202 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] wifi: mt76: publish legacy NPU rings after IRQ and NAPI setup
+
+Keep legacy host RX queues unpublished during allocation and refill.
+Install NAPI before requesting a shared IRQ, validate the descriptor DMA
+range and publish count/indices before the base pointer. Fully unwind
+pre-publication failures so allocation or IRQ errors can be retried.
+
+Do not reset these rings through the generic allocator. A chip frontend
+still needs a verified DMA quiescence sequence before resetting or freeing
+a published queue. Ignore shared interrupts without a pending queue bit.
+
+---
+--- a/dma.c
++++ b/dma.c
+@@ -221,7 +221,8 @@
+ void mt76_dma_queue_reset(struct mt76_dev *dev, struct mt76_queue *q,
+ 			  bool reset_idx)
+ {
+-	if (!q || !q->ndesc)
++	/* Legacy hostadpt rings are published only after IRQ/NAPI setup. */
++	if (!q || !q->ndesc || mt76_queue_is_npu_legacy(q))
+ 		return;
+ 
+ 	if (!mt76_queue_is_wed_rro_ind(q) &&
+--- a/mt76.h
++++ b/mt76.h
+@@ -1692,10 +1692,16 @@
+ 
+ #ifdef CONFIG_MT76_NPU_LEGACY
+ int mt76_npu_legacy_rx_fill(struct mt76_dev *dev, struct mt76_queue *q);
++int mt76_npu_legacy_rx_publish(struct mt76_queue *q);
+ struct sk_buff *mt76_npu_legacy_rx_dequeue(struct mt76_dev *dev,
+ 					 struct mt76_queue *q, u32 *info);
+ void mt76_npu_legacy_rx_cleanup(struct mt76_dev *dev, struct mt76_queue *q);
+ #else
++static inline int mt76_npu_legacy_rx_publish(struct mt76_queue *q)
++{
++	return -EOPNOTSUPP;
++}
++
+ static inline int mt76_npu_legacy_rx_fill(struct mt76_dev *dev, struct mt76_queue *q)
+ {
+ 	return 0;
+--- a/npu.c
++++ b/npu.c
+@@ -201,6 +201,7 @@
+ 	int qid = q - &dev->q_rx[0];
+ 	int index = qid - MT_RXQ_NPU0;
+ 	struct airoha_npu *npu;
++	irqreturn_t ret = IRQ_NONE;
+ 	u32 status;
+ 
+ 	rcu_read_lock();
+@@ -210,14 +211,18 @@
+ 		goto out;
+ 
+ 	status = airoha_npu_wlan_get_irq_status(npu, index);
++	if (!status)
++		goto out;
+ 	airoha_npu_wlan_set_irq_status(npu, status);
+ 
+ 	airoha_npu_wlan_disable_irq(npu, index);
+-	napi_schedule(&dev->napi[qid]);
++	if (!q->stopped)
++		napi_schedule(&dev->napi[qid]);
++	ret = IRQ_HANDLED;
+ out:
+ 	rcu_read_unlock();
+ 
+-	return IRQ_HANDLED;
++	return ret;
+ }
+ 
+ int mt76_npu_dma_add_buf(struct mt76_phy *phy, struct mt76_queue *q,
+@@ -277,13 +282,14 @@
+ 	int err, irq, qid = q - &dev->q_rx[0];
+ 	int size, index = qid - MT_RXQ_NPU0;
+ 	bool legacy = false, legacy_queue = false;
++	bool irq_requested = false, napi_added = false;
+ 	struct airoha_npu *npu;
+ 	const char *name;
+ 
+ 	mutex_lock(&dev->mutex);
+ 
+ 	npu = rcu_dereference_protected(dev->mmio.npu, &dev->mutex);
+-	irq = npu && index >= 0 && index < ARRAY_SIZE(npu->irqs) ? npu->irqs[index]
++	irq = npu && (unsigned int)index < ARRAY_SIZE(npu->irqs) ? npu->irqs[index]
+ 						   : -EINVAL;
+ 	if (irq < 0) {
+ 		err = irq;
+@@ -302,6 +308,18 @@
+ 	if (legacy && q->ndesc) {
+ 		err = -EBUSY;
+ 		goto out;
++	}
++	if (legacy) {
++		u32 base, reg = airoha_npu_wlan_get_queue_addr(npu, index, false);
++
++		err = regmap_read(npu->regmap, reg, &base);
++		if (err)
++			goto out;
++		if (base) {
++			err = -EBUSY;
++			goto out;
++		}
++		airoha_npu_wlan_disable_irq(npu, index);
+ 	}
+ 	legacy_queue = legacy;
+ 	q->flags = MT_NPU_Q_RX(index);
+@@ -329,24 +347,47 @@
+ 		goto out;
+ 	}
+ 
++	if (legacy) {
++		/* A shared IRQ may run as soon as request_irq() installs the handler. */
++		netif_napi_add(dev->napi_dev, &dev->napi[qid], mt76_npu_rx_poll);
++		napi_enable(&dev->napi[qid]);
++		napi_added = true;
++	}
+ 	err = devm_request_irq(dev->dev, irq, mt76_npu_irq_handler,
+ 			       IRQF_SHARED, name, q);
+ 	if (err)
+ 		goto out;
+ 
+-	netif_napi_add(dev->napi_dev, &dev->napi[qid], mt76_npu_rx_poll);
+-	if (!legacy)
++	irq_requested = true;
++	if (!legacy) {
++		netif_napi_add(dev->napi_dev, &dev->napi[qid], mt76_npu_rx_poll);
+ 		mt76_npu_fill_rx_queue(dev, q);
+-	napi_enable(&dev->napi[qid]);
++		napi_enable(&dev->napi[qid]);
++	}
++	if (legacy)
++		err = mt76_npu_legacy_rx_publish(q);
+ out:
+ 	if (err && legacy_queue) {
+-		/* Initialization is called with the host RX DMA engines quiesced. */
++		/* All failure exits precede base publication: no DMA owns these pages. */
++		if (irq_requested)
++			devm_free_irq(dev->dev, irq, q);
++		if (napi_added) {
++			napi_disable(&dev->napi[qid]);
++			netif_napi_del(&dev->napi[qid]);
++		}
+ 		if (q->desc && q->entry)
+ 			mt76_npu_legacy_rx_cleanup(dev, q);
+ 		if (q->page_pool) {
+ 			page_pool_destroy(q->page_pool);
+ 			q->page_pool = NULL;
+ 		}
++		if (q->desc)
++			dmam_free_coherent(dev->dma_dev,
++				q->ndesc * AIROHA_WLAN_LEGACY_RX_DESC_BYTES,
++				q->desc, q->desc_dma);
++		devm_kfree(dev->dev, q->entry);
++		q->desc = NULL;
++		q->entry = NULL;
+ 		q->ndesc = 0;
+ 	}
+ 	mutex_unlock(&dev->mutex);
+--- a/npu_rx_legacy.c
++++ b/npu_rx_legacy.c
+@@ -50,12 +50,32 @@
+ 		filled++;
+ 	}
+ 
+-	if (filled && q->queued == q->ndesc) {
+-		dma_wmb();
+-		Q_WRITE(q, dma_idx, q->head);
+-	}
+-
+ 	return filled;
++}
++
++int mt76_npu_legacy_rx_publish(struct mt76_queue *q)
++{
++	size_t size = q->ndesc * AIROHA_WLAN_LEGACY_RX_DESC_BYTES;
++
++	if (!q->desc || !q->entry || !q->page_pool || q->stopped ||
++	    q->ndesc != AIROHA_WLAN_LEGACY_RX_DESC_COUNT ||
++	    q->queued != q->ndesc || q->head || q->tail)
++		return -EINVAL;
++	if (upper_32_bits(q->desc_dma) ||
++	    upper_32_bits(q->desc_dma + size - 1) || (q->desc_dma & 7))
++		return -ERANGE;
++	if (Q_READ(q, desc_base))
++		return -EBUSY;
++
++	/* NAPI and the IRQ handler must be ready before this commit point. */
++	Q_WRITE(q, ring_size, q->ndesc);
++	/* Hostadpt names offset +8 DMA (producer), +12 CPU (consumer). */
++	Q_WRITE(q, cpu_idx, 0);
++	Q_WRITE(q, dma_idx, 0);
++	dma_wmb();
++	Q_WRITE(q, desc_base, lower_32_bits(q->desc_dma));
++
++	return 0;
+ }
+ 
+ static int

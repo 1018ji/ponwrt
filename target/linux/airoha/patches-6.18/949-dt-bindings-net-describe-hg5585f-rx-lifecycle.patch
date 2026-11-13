@@ -1,0 +1,114 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] dt-bindings: net: describe HG5585F RX ownership and memory
+
+Describe exclusive NPU/GDMA reset resources, legacy RX packet and reorder
+reservations, and the explicit MT7916 RX handoff selection.
+
+---
+--- a/Documentation/devicetree/bindings/net/airoha,en7581-npu.yaml
++++ b/Documentation/devicetree/bindings/net/airoha,en7581-npu.yaml
+@@ -20,7 +20,26 @@
+       - airoha,en7581-npu
+ 
+   reg:
+-    maxItems: 1
++    minItems: 1
++    items:
++      - description: NPU registers and local data memory
++      - description: Exclusive legacy RX copy GDMA controller
++
++  reg-names:
++    minItems: 1
++    items:
++      - const: npu
++      - const: rx-copy
++
++  resets:
++    items:
++      - description: NPU reset
++      - description: Exclusive RX copy GDMA controller reset
++
++  reset-names:
++    items:
++      - const: npu
++      - const: rx-copy
+ 
+   firmware-name:
+     items:
+@@ -62,13 +81,24 @@
+           - description: NPU wlan offload RX buffers region
+           - description: NPU wlan offload TX buffers region
+           - description: NPU wlan offload TX packet identifiers region
++      - items:
++          - description: Legacy NPU firmware binary region
++          - description: Legacy RX packet pool
++          - description: Legacy RX reorder nodes
+ 
+   memory-region-names:
+-    items:
+-      - const: firmware
+-      - const: pkt
+-      - const: tx-pkt
+-      - const: tx-bufid
++    oneOf:
++      - items:
++          - const: binary
++      - items:
++          - const: firmware
++          - const: pkt
++          - const: tx-pkt
++          - const: tx-bufid
++      - items:
++          - const: binary
++          - const: pkt
++          - const: ba
+ 
+ required:
+   - compatible
+@@ -83,11 +113,22 @@
+     then:
+       required:
+         - firmware-name
++        - reg-names
++        - resets
++        - reset-names
+       properties:
++        reg:
++          minItems: 2
++        reg-names:
++          minItems: 2
+         firmware-name:
+           items:
+             - const: airoha/hg5585f_npu_rv32.bin
+             - const: airoha/hg5585f_npu_data.bin
++    else:
++      properties:
++        reg:
++          maxItems: 1
+ 
+ additionalProperties: false
+ 
+--- a/Documentation/devicetree/bindings/net/wireless/mediatek,mt76.yaml
++++ b/Documentation/devicetree/bindings/net/wireless/mediatek,mt76.yaml
+@@ -75,6 +75,13 @@
+   airoha,npu:
+     $ref: /schemas/types.yaml#/definitions/phandle
+     description: Airoha NPU supplying firmware and optional wireless queues.
++
++  airoha,hg5585f-rx-offload:
++    type: boolean
++    description:
++      Use the HG5585F 2024 NPU for MT7916 receive DMA and reordering.
++      Frames return to Linux for forwarding. Requires exclusive NPU and
++      RX copy GDMA reset resources in the NPU supplier.
+ 
+   airoha,eth:
+     $ref: /schemas/types.yaml#/definitions/phandle
+@@ -250,6 +257,7 @@
+           maxItems: 1
+ 
+ dependencies:
++  airoha,hg5585f-rx-offload: ["airoha,npu"]
+   airoha,wed: ["airoha,npu", "airoha,eth"]
+ 
+ unevaluatedProperties: false

@@ -1,0 +1,117 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] net: airoha: prepare host PPE for legacy WLAN and WED
+
+Allow WED transmit with the explicit HG5585F host-managed PPE mode.
+Wait for Ethernet registration, configure PPE before attaching WED and
+preserve upstream firmware initialization. Receive forwarding remains in
+Linux; this does not enable the unverified legacy RX-to-PPE path.
+
+---
+--- a/drivers/net/ethernet/airoha/Kconfig
++++ b/drivers/net/ethernet/airoha/Kconfig
+@@ -57,8 +57,9 @@
+ 	help
+ 	  Enable the HG5585F WED1/WDMA1 transmit provider for MT7916D.
+ 	  Requires an explicit WED device-tree overlay and mt7915e.wed_enable=1.
+-	  Retains the upstream NPU firmware for PPE and software Wi-Fi RX.
+-	  This provider does not support NPU receive offloading.
++	  Uses the upstream NPU firmware or explicit host-managed legacy PPE.
++	  A separate combined overlay allows legacy NPU receive/reorder with
++	  Linux forwarding alongside WED transmit.
+ 
+ config NET_AIROHA_PPE_HG5585F
+ 	bool "HG5585F host-managed PPE (experimental)"
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1964,6 +1964,25 @@
+ 	return err;
+ }
+ 
++static int airoha_ppe_prepare_legacy(struct airoha_ppe_dev *dev)
++{
++	struct airoha_ppe *ppe = dev->priv;
++	struct airoha_eth *eth = ppe->eth;
++	int err = 0;
++
++	if (!ppe->host_managed)
++		return -EOPNOTSUPP;
++	if (!test_bit(DEV_STATE_REGISTERED, &eth->state))
++		return -EPROBE_DEFER;
++
++	mutex_lock(&flow_offload_mutex);
++	if (!eth->npu)
++		err = airoha_ppe_offload_setup(eth);
++	mutex_unlock(&flow_offload_mutex);
++
++	return err;
++}
++
+ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data)
+ {
+ 	struct airoha_ppe *ppe = dev->priv;
+@@ -2052,7 +2071,7 @@
+ 	}
+ 
+ 	eth = platform_get_drvdata(pdev);
+-	if (!eth)
++	if (!eth || !test_bit(DEV_STATE_REGISTERED, &eth->state))
+ 		goto error_module_put;
+ 
+ 	if (!device_link_add(dev, &pdev->dev, DL_FLAG_AUTOREMOVE_SUPPLIER)) {
+@@ -2097,6 +2116,7 @@
+ 	ppe->dev.ops.check_skb = airoha_ppe_check_skb;
+ 	ppe->dev.ops.flush_wed = airoha_ppe_flush_wed;
+ 	ppe->dev.ops.set_wed = airoha_ppe_set_wed;
++	ppe->dev.ops.prepare_legacy = airoha_ppe_prepare_legacy;
+ 	ppe->dev.priv = ppe;
+ 	ppe->eth = eth;
+ 	ppe->host_managed = of_property_read_bool(eth->dev->of_node,
+--- a/drivers/net/ethernet/airoha/airoha_wed.c
++++ b/drivers/net/ethernet/airoha/airoha_wed.c
+@@ -542,6 +542,7 @@
+ 	struct airoha_wed *aw;
+ 	struct airoha_npu *npu;
+ 	struct device_link *link = NULL;
++	bool legacy;
+ 	int err = -ENODEV;
+ 
+ 	rcu_read_unlock();
+@@ -567,10 +568,9 @@
+ 		err = PTR_ERR(npu);
+ 		goto out;
+ 	}
+-	if (npu->wlan_abi != AIROHA_NPU_WLAN_ABI_UPSTREAM)
+-		err = -EOPNOTSUPP;
+-	else
+-		err = 0;
++	legacy = npu->wlan_abi == AIROHA_NPU_WLAN_ABI_HG5585F_2024;
++	err = legacy || npu->wlan_abi == AIROHA_NPU_WLAN_ABI_UPSTREAM ?
++	      0 : -EOPNOTSUPP;
+ 	airoha_npu_put(npu);
+ 	if (err)
+ 		goto out;
+@@ -579,6 +579,14 @@
+ 		err = PTR_ERR(aw->ppe);
+ 		aw->ppe = NULL;
+ 		goto out;
++	}
++	if (legacy) {
++		err = aw->ppe->ops.prepare_legacy(aw->ppe);
++		if (err) {
++			airoha_ppe_put_dev(aw->ppe);
++			aw->ppe = NULL;
++			goto out;
++		}
+ 	}
+ 	link = device_link_add(&pci->dev, aw->dev, DL_FLAG_AUTOREMOVE_CONSUMER);
+ 	if (!link) {
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -18,6 +18,7 @@
+ 	struct {
+ 		int (*setup_tc_block_cb)(struct airoha_ppe_dev *dev,
+ 					 void *type_data);
++		int (*prepare_legacy)(struct airoha_ppe_dev *dev);
+ 		int (*set_wed)(struct airoha_ppe_dev *dev, bool enable);
+ 		int (*flush_wed)(struct airoha_ppe_dev *dev, u16 wcid);
+ 		void (*check_skb)(struct airoha_ppe_dev *dev,

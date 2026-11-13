@@ -1,0 +1,247 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+
+umask 077
+expect=auto
+startup_wait=0
+interval=3
+samples=2
+require_traffic=0
+read_timeout=5
+archive=1
+fs_root=
+output=
+phy=
+
+usage() {
+	cat <<'EOF'
+Usage: hg5585f-offload-check [options]
+  --expect auto|native|rx|wed|combined  Expected mode (default: auto from DT)
+  --wait SECONDS                     Wait for driver readiness, 0..120
+  --interval SECONDS                 Counter sampling interval, 1..60
+  --samples COUNT                    Number of snapshots, 2..10
+  --require-traffic                  Warn if a required path does not advance
+  --phy NAME                         Restrict to one PHY, e.g. phy0
+  --output DIRECTORY                 Create a new private report directory
+  --root DIRECTORY                   Read an offline /proc and /sys fixture
+  --read-timeout SECONDS             Per-read limit, 1..10 (default: 5)
+  --no-archive                       Keep report directory without a tar.gz
+  --help
+
+No traffic, recovery, register writes, mounts or configuration changes are made.
+Exit: 0=PASS/READY/SKIP, 1=FAIL, 2=WARN, 64=invalid arguments, 73=report I/O error.
+EOF
+}
+
+bad_args() { printf '%s\n' "$*" >&2; exit 64; }
+need_value() {
+	if [ "$#" -lt 2 ] || [ -z "$2" ]; then bad_args "Missing value for $1"; fi
+}
+number() {
+	case "$2" in ''|*[!0-9]*|?????*) bad_args "Invalid $1: $2";; esac
+	if [ "$2" -lt "$3" ] || [ "$2" -gt "$4" ]; then bad_args "Out of range $1: $2"; fi
+}
+decimal() {
+	local value="$1"
+	while [ "${#value}" -gt 1 ] && [ "${value#0}" != "$value" ]; do value=${value#0}; done
+	printf '%s' "$value"
+}
+
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--expect) need_value "$@"; expect=$2; shift 2;;
+		--wait) need_value "$@"; startup_wait=$2; shift 2;;
+		--interval) need_value "$@"; interval=$2; shift 2;;
+		--samples) need_value "$@"; samples=$2; shift 2;;
+		--phy) need_value "$@"; phy=$2; shift 2;;
+		--output) need_value "$@"; output=$2; shift 2;;
+		--root) need_value "$@"; fs_root=$2; shift 2;;
+		--read-timeout) need_value "$@"; read_timeout=$2; shift 2;;
+		--require-traffic) require_traffic=1; shift;;
+		--no-archive) archive=0; shift;;
+		--help|-h) usage; exit 0;;
+		*) bad_args "Unknown option: $1";;
+	esac
+done
+case "$expect" in auto|native|rx|wed|combined) ;; *) bad_args "Invalid expected mode: $expect";; esac
+case "$phy" in *[!a-zA-Z0-9_.-]*|.|..) bad_args "Invalid PHY name: $phy";; esac
+number wait "$startup_wait" 0 120
+number interval "$interval" 1 60
+number samples "$samples" 2 10
+number read-timeout "$read_timeout" 1 10
+startup_wait=$(decimal "$startup_wait")
+interval=$(decimal "$interval")
+samples=$(decimal "$samples")
+read_timeout=$(decimal "$read_timeout")
+path_nl='
+'
+path_cr=$(printf '\r')
+case "$fs_root$output" in *"$path_nl"*|*"$path_cr"*) bad_args 'Newlines are not supported in paths';; esac
+if [ -n "$fs_root" ]; then
+	fs_root=$(CDPATH='' cd -- "$fs_root" 2>/dev/null && pwd -P) || bad_args 'Offline root does not exist'
+	[ "$fs_root" = / ] && fs_root=
+fi
+report_awk=${HG5585F_REPORT_AWK:-}
+if [ -z "$report_awk" ]; then
+	script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P) || exit 73
+	report_awk=$script_dir/offload-report.awk
+	[ -r "$report_awk" ] || report_awk=/usr/libexec/hg5585f-offload-report.awk
+fi
+[ -r "$report_awk" ] || bad_args 'Missing offload-report.awk'
+
+if [ -z "$output" ]; then
+	output=$(mktemp -d /tmp/hg5585f-offload.XXXXXX) || exit 73
+else
+	mkdir -m 700 -- "$output" 2>/dev/null || { printf 'Cannot create new report directory: %s\n' "$output" >&2; exit 73; }
+	output=$(CDPATH='' cd -- "$output" && pwd -P) || exit 73
+fi
+printf 'Report: %s\n' "$output"
+trap 'printf "Interrupted\n" >&2; exit 130' INT
+trap 'printf "Interrupted\n" >&2; exit 143' TERM
+
+have_timeout=0
+command -v timeout >/dev/null 2>&1 && have_timeout=1
+printf 'format=1\nexpected=%s\nsamples=%s\ninterval=%s\nroot=%s\n' \
+	"$expect" "$samples" "$interval" "${fs_root:-/}" > "$output/run.txt"
+
+# The caller provides the destination; inputs are never opened for writing.
+capture() {
+	local dest="$1" input="$2" reader="${3:-head}" rc
+	if [ ! -r "$input" ]; then
+		printf 'unavailable: %s\n' "$input" > "$dest.stderr"
+		return 1
+	fi
+	if [ "$have_timeout" != 1 ]; then
+		printf 'timeout command unavailable; bounded read skipped\n' > "$dest.stderr"
+		return 1
+	fi
+	timeout "$read_timeout" "$reader" -c 131072 "$input" > "$dest" 2> "$dest.stderr"
+	rc=$?
+	if [ "$reader" = head ] && [ "$rc" = 0 ] && [ "$(wc -c < "$dest")" -ge 131072 ]; then
+		printf 'Capture size limit reached\n' >> "$dest.stderr"
+		rc=125
+	fi
+	printf '%s\n' "$rc" > "$dest.exit"
+	return "$rc"
+}
+
+status_paths() {
+	local file name
+	for file in "$fs_root"/sys/kernel/debug/ieee80211/*/mt76/offload_status; do
+		[ -e "$file" ] || continue
+		name=${file%/mt76/offload_status}; name=${name##*/}
+		[ -z "$phy" ] || [ "$name" = "$phy" ] || continue
+		case "$name" in ''|*[!a-zA-Z0-9_.-]*) continue;; esac
+		printf '%s\n' "$file"
+	done
+}
+
+mkdir -m 700 "$output/system" || exit 73
+for item in etc/openwrt_release etc/os-release sys/firmware/devicetree/base/model \
+	sys/firmware/devicetree/base/compatible sys/module/mt7915e/srcversion sys/module/mt76/srcversion; do
+	name=$(printf '%s' "$item" | tr / _)
+	capture "$output/system/$name.txt" "$fs_root/$item" || :
+done
+
+dt_known=0 dt_rx=0 dt_wed=0
+dt_root=$fs_root/sys/firmware/devicetree/base
+if [ -d "$dt_root" ]; then
+	dt_known=1
+	# Only property names are inspected; EEPROM and configuration are not read.
+	find "$dt_root" -name 'airoha,hg5585f-rx-offload' > "$output/dt-rx-paths.txt" 2> "$output/dt-find.stderr"
+	find "$dt_root" -name 'airoha,wed' > "$output/dt-wed-paths.txt" 2>> "$output/dt-find.stderr"
+	[ ! -s "$output/dt-find.stderr" ] || dt_known=0
+	[ ! -s "$output/dt-rx-paths.txt" ] || dt_rx=1
+	[ ! -s "$output/dt-wed-paths.txt" ] || dt_wed=1
+fi
+
+if [ "$startup_wait" -gt 0 ] && [ "$have_timeout" = 1 ]; then
+	deadline=$(( $(date +%s) + startup_wait ))
+	while [ "$(date +%s)" -lt "$deadline" ]; do
+		ready=0
+		status_paths > "$output/startup-paths.txt"
+		while IFS= read -r file; do
+			remaining=$((deadline - $(date +%s)))
+			[ "$remaining" -gt 0 ] || break
+			probe_timeout=$read_timeout
+			[ "$remaining" -ge "$read_timeout" ] || read_timeout=$remaining
+			if capture "$output/startup-status.txt" "$file" && awk -F ': *' -v mode="$expect" -v known="$dt_known" -v dtr="$dt_rx" -v dtw="$dt_wed" '
+				$1=="format" {f=$2} $1=="expected_rx" {r=$2} $1=="expected_wed" {w=$2}
+				$1=="rx_configured" {rc=$2} $1=="tx_running" {tc=$2}
+				END {
+					if (mode=="auto") {nr=known?dtr:r; nw=known?dtw:w}
+					else {nr=mode=="rx" || mode=="combined"; nw=mode=="wed" || mode=="combined"}
+					exit !(f==1 && (!nr || (r==1 && rc==1)) && (!nw || (w==1 && tc==1)))
+				}
+			' "$output/startup-status.txt"; then ready=1; fi
+			read_timeout=$probe_timeout
+			[ "$ready" = 0 ] || break
+		done < "$output/startup-paths.txt"
+		[ "$ready" = 0 ] || break
+		[ "$(date +%s)" -lt "$deadline" ] || break
+		sleep 1
+	done
+fi
+
+sample=1
+while [ "$sample" -le "$samples" ]; do
+	base=$output/sample-$sample
+	mkdir -m 700 "$base" "$base/status" "$base/proc" "$base/logs" || exit 73
+	for item in uptime stat interrupts modules meminfo version net/dev sys/kernel/random/boot_id; do
+		name=$(printf '%s' "$item" | tr / _)
+		capture "$base/proc/$name.txt" "$fs_root/proc/$item" || :
+	done
+	capture "$base/wed-enable.txt" "$fs_root/sys/module/mt7915e/parameters/wed_enable" || :
+	status_paths > "$base/status-paths.txt"
+	while IFS= read -r file; do
+		name=${file%/mt76/offload_status}; name=${name##*/}
+		if ! capture "$base/status/$name.txt" "$file"; then
+			[ ! -f "$base/status/$name.txt" ] || mv "$base/status/$name.txt" "$base/status/$name.partial"
+			printf 'capture_error: 1\n' > "$base/status/$name.txt"
+		fi
+	done < "$base/status-paths.txt"
+	if [ -n "$fs_root" ]; then
+		capture "$base/logs/dmesg.txt" "$fs_root/dmesg.txt" tail || :
+	else
+		if [ "$have_timeout" = 1 ]; then
+			{
+				timeout "$read_timeout" dmesg
+				printf '%s\n' "$?" > "$base/logs/dmesg.exit"
+			} 2> "$base/logs/dmesg.stderr" | tail -c 131072 | tail -n 400 > "$base/logs/dmesg.txt"
+		fi
+	fi
+	[ "$sample" -eq "$samples" ] || sleep "$interval"
+	sample=$((sample + 1))
+done
+
+set --
+for file in "$output"/sample-*/status/*.txt; do
+	[ ! -f "$file" ] || set -- "$@" "$file"
+done
+for file in "$output"/sample-*/logs/dmesg.txt "$output"/sample-*/logs/dmesg.stderr \
+	"$output"/sample-*/logs/dmesg.exit "$output"/sample-*/wed-enable.txt; do
+	[ ! -f "$file" ] || set -- "$@" "$file"
+done
+# With no inputs, awk must receive /dev/null instead of waiting on stdin.
+[ "$#" -gt 0 ] || set -- /dev/null
+HG_EXPECT=$expect HG_DT_KNOWN=$dt_known HG_DT_RX=$dt_rx HG_DT_WED=$dt_wed \
+HG_REQUIRE_TRAFFIC=$require_traffic HG_SAMPLES=$samples HG_PHY=$phy HG_REPORT_DIR=$output \
+	awk -f "$report_awk" "$@" > "$output/report.txt"
+result=$?
+if [ "$result" -gt 2 ] || [ ! -s "$output/summary.json" ]; then
+	printf 'Report analysis failed\n' >&2
+	exit 73
+fi
+cat "$output/report.txt"
+printf '%s\n' "$result" > "$output/exit-code" || exit 73
+printf 'complete\n' > "$output/complete" || exit 73
+
+if [ "$archive" = 1 ] && command -v tar >/dev/null 2>&1 && command -v gzip >/dev/null 2>&1; then
+	parent=${output%/*}; name=${output##*/}
+	if (set -C; tar -cz -C "$parent" "$name" > "$output.tar.gz") 2> "$output/archive.stderr"; then
+		printf 'Archive: %s.tar.gz\n' "$output"
+	else
+		printf 'Archive unavailable; report directory retained\n' >&2
+	fi
+fi
+exit "$result"

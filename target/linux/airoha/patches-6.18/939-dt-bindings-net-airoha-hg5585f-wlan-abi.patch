@@ -1,0 +1,48 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] dt-bindings: net: airoha: describe HG5585F WLAN diagnostic ABI
+
+Describe the explicit ABI selector and its matching stock firmware pair.
+
+---
+--- a/Documentation/devicetree/bindings/net/airoha,en7581-npu.yaml
++++ b/Documentation/devicetree/bindings/net/airoha,en7581-npu.yaml
+@@ -22,6 +22,19 @@
+   reg:
+     maxItems: 1
+ 
++  firmware-name:
++    items:
++      - description: NPU RV32 firmware
++      - description: NPU data firmware
++
++  airoha,wlan-firmware-abi:
++    $ref: /schemas/types.yaml#/definitions/string
++    const: hg5585f-2024
++    description: |
++      Select the HG5585F 2024 fixed-size WLAN mailbox protocol for diagnostics.
++      The stock firmware has no verified upstream PPE mailbox ABI.
++
++
+   interrupts:
+     items:
+       - description: mbox host irq line
+@@ -63,6 +76,19 @@
+   - interrupts
+   - memory-region
+ 
++allOf:
++  - if:
++      required:
++        - airoha,wlan-firmware-abi
++    then:
++      required:
++        - firmware-name
++      properties:
++        firmware-name:
++          items:
++            - const: airoha/hg5585f_npu_rv32.bin
++            - const: airoha/hg5585f_npu_data.bin
++
+ additionalProperties: false
+ 
+ examples:

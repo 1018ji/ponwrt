@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+
+/* WED transmit with the upstream PPE firmware; native Wi-Fi receive. */
+&{/soc} {
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	hg5585f_wed1: wed@1fa03000 {
+		compatible = "airoha,en7581-wed";
+		reg = <0x0 0x1fa03000 0x0 0xb00>,
+		      <0x0 0x1fa06400 0x0 0x400>;
+		reg-names = "wed", "wdma";
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SPI 68 IRQ_TYPE_LEVEL_HIGH>;
+		airoha,pcie = <&pcie1>;
+	};
+};
+
+&hg5585f_wifi {
+	airoha,wed = <&hg5585f_wed1>;
+};

@@ -1,0 +1,80 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] dt-bindings: net: describe HG5585F WLAN offload resources
+
+Describe WED1, WDMA1 and the associated NPU supplier for the HG5585F
+primary MT7916 HIF register diagnostics.
+
+---
+--- /dev/null
++++ b/Documentation/devicetree/bindings/net/fiberhome,hg5585f-wlan-offload.yaml
+@@ -0,0 +1,70 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/net/fiberhome,hg5585f-wlan-offload.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: FiberHome HG5585F EN7581 WLAN offload resources
++
++maintainers:
++  - PonWrt developers <noreply@localhost>
++
++description: |
++  WED1 and WDMA1 resources used by the MT7916 primary PCIe HIF on HG5585F.
++  The experimental driver only exposes a read whitelist for diagnostics.
++  It does not configure DMA rings or take ownership of the interrupt.
++
++properties:
++  compatible:
++    const: fiberhome,hg5585f-wlan-offload
++
++  reg:
++    items:
++      - description: WED1 registers
++      - description: WDMA1 registers
++
++  reg-names:
++    items:
++      - const: wed
++      - const: wdma
++
++  interrupts:
++    maxItems: 1
++
++  interrupt-names:
++    items:
++      - const: wed
++
++  airoha,npu:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description: NPU supplying the host RX queue registers.
++
++required:
++  - compatible
++  - reg
++  - reg-names
++  - interrupts
++  - interrupt-names
++  - airoha,npu
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/interrupt-controller/arm-gic.h>
++
++    soc {
++        #address-cells = <2>;
++        #size-cells = <2>;
++
++        wlan-offload@1fa03000 {
++            compatible = "fiberhome,hg5585f-wlan-offload";
++            reg = <0x0 0x1fa03000 0x0 0xb00>,
++                  <0x0 0x1fa06400 0x0 0x400>;
++            reg-names = "wed", "wdma";
++            interrupt-parent = <&gic>;
++            interrupts = <GIC_SPI 68 IRQ_TYPE_LEVEL_HIGH>;
++            interrupt-names = "wed";
++            airoha,npu = <&npu>;
++        };
++    };

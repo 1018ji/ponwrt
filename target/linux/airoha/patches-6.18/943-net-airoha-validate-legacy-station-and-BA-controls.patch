@@ -1,0 +1,91 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] net: airoha: validate legacy STA/BA controls and scope RX IRQ status
+
+Command 6 resets all eight reorder sessions for the supplied WCID on
+both station insertion and removal. Validate the stock 8-bit WCID and
+3/8/9/12-bit BA fields before sending them to firmware.
+
+Return only the requested RX queue interrupt bit so acknowledging one
+shared interrupt cannot discard another queue's pending event.
+
+---
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -533,6 +533,24 @@
+ 		wire_id = airoha_wlan_legacy_set_id(func_id);
+ 		if (wire_id < 0)
+ 			return wire_id;
++		if (func_id == WLAN_FUNC_SET_WAIT_DEL_STA ||
++		    func_id == WLAN_FUNC_SET_WAIT_BA_WIN_SIZE) {
++			__le32 payload;
++			u32 val, encoded;
++
++			if (ifindex > 1 || data_len != sizeof(payload))
++				return -EINVAL;
++			memcpy(&payload, data, sizeof(payload));
++			val = le32_to_cpu(payload);
++			if (func_id == WLAN_FUNC_SET_WAIT_DEL_STA)
++				err = airoha_wlan_legacy_sta_encode(val, &encoded);
++			else
++				err = airoha_wlan_legacy_ba_encode((val >> 3) & 0xff,
++								   val & 7, (val >> 11) & 0x1ff,
++								   val >> 20, &encoded);
++			if (err)
++				return err;
++		}
+ 	}
+ 
+ 	len = sizeof(*wlan_data) + data_len;
+@@ -668,10 +686,10 @@
+ 
+ static u32 airoha_npu_wlan_irq_status_get(struct airoha_npu *npu, int q)
+ {
+-	u32 val;
++	u32 val = 0;
+ 
+ 	regmap_read(npu->regmap, REG_IRQ_STATUS, &val);
+-	return val;
++	return val & NPU_IRQ_RX_MASK(q);
+ }
+ 
+ static void airoha_npu_wlan_irq_enable(struct airoha_npu *npu, int q)
+--- a/include/linux/soc/airoha/airoha_wlan_legacy.h
++++ b/include/linux/soc/airoha/airoha_wlan_legacy.h
+@@ -26,6 +26,7 @@
+ 	case WLAN_FUNC_SET_WAIT_TRAN_TO_CPU:
+ 	case WLAN_FUNC_SET_WAIT_BA_WIN_SIZE:
+ 	case WLAN_FUNC_SET_WAIT_DRIVER_MODEL:
++	case WLAN_FUNC_SET_WAIT_DEL_STA:
+ 	case WLAN_FUNC_SET_WAIT_DRAM_BA_NODE_ADDR:
+ 	case WLAN_FUNC_SET_WAIT_PKT_BUF_ADDR:
+ 	case WLAN_FUNC_SET_WAIT_IS_TEST_NOBA:
+@@ -54,6 +55,29 @@
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
++}
++
++/* The same command resets all eight reorder sessions on STA add and delete. */
++static inline int airoha_wlan_legacy_sta_encode(unsigned int wcid, u32 *value)
++{
++	if (wcid > 255)
++		return -ERANGE;
++	*value = wcid;
++
++	return 0;
++}
++
++/* A zero window/SSN deletes the session. Never truncate a WCID or TID. */
++static inline int
++airoha_wlan_legacy_ba_encode(unsigned int wcid, unsigned int tid,
++			     unsigned int window, unsigned int ssn, u32 *value)
++{
++	if (wcid > 255 || tid > 7 || window > 511 || ssn > 4095 ||
++	    (!window && ssn))
++		return -ERANGE;
++	*value = (ssn << 20) | (window << 11) | (wcid << 3) | tid;
++
++	return 0;
+ }
+ 
+ #define AIROHA_WLAN_LEGACY_RX_DONE	BIT(0)

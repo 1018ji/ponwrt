@@ -1,0 +1,49 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] net: airoha: fix WED flow teardown and multiple SSID binding
+
+Remove invalidated bridge subflows before statistics can dereference the
+invalid hash sentinel. Reject out-of-range FOE indices before accessing
+the table. Identify TC callbacks by wireless netdev so two SSIDs can bind
+independently while sharing the WED provider.
+
+---
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -879,6 +879,9 @@
+ 
+ 	lockdep_assert_held(&ppe_lock);
+ 
++	if (hash >= airoha_ppe_get_total_num_entries(ppe))
++		return NULL;
++
+ 	if (hash < sram_num_entries) {
+ 		u32 *hwe = ppe->foe + hash * sizeof(struct airoha_foe_entry);
+ 		bool ppe2 = hash >= PPE_SRAM_NUM_ENTRIES;
+@@ -1078,11 +1081,14 @@
+ 		e->disabled = true;
+ 		if (e->type == FLOW_TYPE_L2) {
+ 			struct airoha_flow_table_entry *sub;
+-
+-			hlist_for_each_entry(sub, &e->l2_flows, l2_subflow_node) {
++			struct hlist_node *n;
++
++			hlist_for_each_entry_safe(sub, n, &e->l2_flows, l2_subflow_node) {
+ 				err = airoha_ppe_wed_invalidate(ppe, sub);
+ 				if (err)
+ 					break;
++				/* Statistics walks this list and requires a valid hash. */
++				airoha_ppe_foe_remove_flow(ppe, sub);
+ 			}
+ 		} else {
+ 			err = airoha_ppe_wed_invalidate(ppe, e);
+--- a/drivers/net/ethernet/airoha/airoha_wed.c
++++ b/drivers/net/ethernet/airoha/airoha_wed.c
+@@ -521,7 +521,7 @@
+ 		return -EOPNOTSUPP;
+ 
+ 	return flow_block_cb_setup_simple(data, &blocks, airoha_wed_setup_cb,
+-					 wed, wed, true);
++					 dev, wed, true);
+ }
+ 
+ static void airoha_wed_ppe_check(struct mtk_wed_device *wed, struct sk_buff *skb,

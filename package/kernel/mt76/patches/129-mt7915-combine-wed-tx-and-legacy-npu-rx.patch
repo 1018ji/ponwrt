@@ -1,0 +1,112 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] wifi: mt76: combine WED transmit and HG5585F NPU receive
+
+Allow the explicit legacy RX and WED overlay combination. Require an
+active WED provider and stop both producers during cleanup and recovery.
+Quarantine both DMA owners if either stop fails. Report active WED
+transmit in diagnostics while keeping received frames on Linux.
+
+---
+--- a/mt7915/dma.c
++++ b/mt7915/dma.c
+@@ -257,8 +257,28 @@
+ 	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
+ 	int err;
+ 
+-	if (dev->mt76.mmio.npu_legacy_rx)
+-		return mt7915_npu_legacy_quiesce(dev);
++	if (dev->mt76.mmio.npu_legacy_rx) {
++		int wed_err = 0;
++
++		/* Stop PPE/WED producers before retiring wireless RX ownership. */
++		if (mtk_wed_device_active(wed))
++			wed_err = mtk_wed_device_quiesce(wed);
++		err = mt7915_npu_legacy_quiesce(dev);
++#ifdef CONFIG_NET_AIROHA_WED
++		if ((err || wed_err) && mtk_wed_device_active(wed)) {
++			struct airoha_npu *npu;
++
++			wed->dma_quarantined = true;
++			mtk_wed_device_quiesce(wed);
++			npu = rcu_dereference_protected(dev->mt76.mmio.npu, 1);
++			if (npu)
++				airoha_npu_wlan_legacy_poison(npu, dev->mt76.dev);
++			WRITE_ONCE(dev->npu_legacy_failed, true);
++			dev->mt76.mmio.npu_quarantined = true;
++		}
++#endif
++		return err ? err : wed_err;
++	}
+ 	if (!mtk_wed_device_active(wed))
+ 		return 0;
+ 	err = mtk_wed_device_quiesce(wed);
+--- a/mt7915/npu_legacy.c
++++ b/mt7915/npu_legacy.c
+@@ -155,8 +155,7 @@
+ 
+ 	if (!of_property_present(dev->mt76.dev->of_node, "airoha,hg5585f-rx-offload"))
+ 		return 0;
+-	if (!is_mt7916(&dev->mt76) || !dev_is_pci(dev->mt76.dev) ||
+-	    of_property_present(dev->mt76.dev->of_node, "airoha,wed"))
++	if (!is_mt7916(&dev->mt76) || !dev_is_pci(dev->mt76.dev))
+ 		return -EOPNOTSUPP;
+ 	pdev = to_pci_dev(dev->mt76.dev);
+ 	return mt76_npu_legacy_init(&dev->mt76, pci_resource_start(pdev, 0));
+@@ -325,7 +324,7 @@
+ 		cancel_work_sync(&dev->reset_work);
+ 	}
+ 	if (!dev->npu_legacy_dma_ready) {
+-		if (!mt7915_npu_legacy_quiesce(dev)) {
++		if (!mt7915_dma_quiesce(dev)) {
+ 			/* Probe failed before NAPI could fill these native queues. */
+ 			mt76_for_each_q_rx(&dev->mt76, q) {
+ 				if (dev->mt76.q_rx[q].page_pool) {
+--- a/mt7915/npu_probe.c
++++ b/mt7915/npu_probe.c
+@@ -63,6 +63,13 @@
+ {
+ 	struct mt7915_dev *dev = s->private;
+ 	struct mt7915_npu_probe *probe = &dev->npu_probe;
++	const char *tx = "disabled";
++
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	if (mtk_wed_device_active(&dev->mt76.mmio.wed) &&
++	    READ_ONCE(dev->mt76.mmio.wed.running))
++		tx = "WED";
++#endif
+ 
+ 	seq_printf(s, "attempted: %u\n", probe->attempted);
+ 	seq_printf(s, "error: %d\n", probe->error);
+@@ -82,7 +89,7 @@
+ 	seq_printf(s, "rx_offload: %s\n",
+ 		   READ_ONCE(dev->npu_legacy_configured) &&
+ 		   !READ_ONCE(dev->npu_legacy_failed) ? "legacy (Linux forwarding)" : "disabled");
+-	seq_puts(s, "tx_offload: disabled\n");
++	seq_printf(s, "tx_offload: %s\n", tx);
+ 	return 0;
+ }
+ DEFINE_SHOW_ATTRIBUTE(mt7915_npu_probe);
+--- a/mt7915/pci.c
++++ b/mt7915/pci.c
+@@ -6,6 +6,7 @@
+ 
+ #include <linux/kernel.h>
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/pci.h>
+ 
+ #include "mt7915.h"
+@@ -143,6 +144,13 @@
+ 	ret = mt7915_mmio_wed_init(dev, pdev, true, &irq);
+ 	if (ret < 0)
+ 		goto free_wed_or_irq_vector;
++
++	if (mdev->mmio.npu_legacy_rx &&
++	    of_property_present(mdev->dev->of_node, "airoha,wed") &&
++	    !mtk_wed_device_active(&mdev->mmio.wed)) {
++		ret = -EOPNOTSUPP;
++		goto free_wed_or_irq_vector;
++	}
+ 
+ 	if (!ret) {
+ 		hif2 = mt7915_pci_init_hif2(pdev);

@@ -1,0 +1,59 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] wifi: mt76: preserve native RX and station setup on Airoha WED
+
+Airoha WED provides transmit DMA without a WO receive processor. Do not
+mirror station or BA records to a nonexistent WO firmware: the provider
+rejects these messages before they can reach the Wi-Fi MCU. Keep native
+receive queues on the software reorder path, including when a separate
+NPU receive queue is present. Only NPU RX queues bypass software reorder.
+Preserve the existing MediaTek WED receive behavior.
+
+---
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1585,8 +1585,12 @@
+ 
+ 	while ((skb = __skb_dequeue(&dev->rx_skb[q])) != NULL) {
+ 		mt76_check_sta(dev, skb);
+-		if (mtk_wed_device_active(&dev->mmio.wed) ||
+-		    mt76_npu_device_active(dev))
++		/* Airoha WED only offloads TX; native RX still needs reordering.
++		 * A legacy NPU can also coexist with a native receive queue.
++		 */
++		if (mt76_wed_has_rx_offload(dev) ||
++		    (mt76_npu_device_active(dev) &&
++		     mt76_queue_is_npu_rx(&dev->q_rx[q])))
+ 			__skb_queue_tail(&frames, skb);
+ 		else
+ 			mt76_rx_aggr_reorder(skb, &frames);
+--- a/mt76.h
++++ b/mt76.h
+@@ -1811,6 +1811,16 @@
+ }
+ #endif /* CONFIG_MT76_NPU */
+ 
++static inline bool mt76_wed_has_rx_offload(struct mt76_dev *dev)
++{
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	return mt76_is_mmio(dev) && mtk_wed_device_active(&dev->mmio.wed) &&
++	       !dev->mmio.wed.airoha;
++#else
++	return false;
++#endif
++}
++
+ static inline bool mt76_npu_device_active(struct mt76_dev *dev)
+ {
+ 	return mt76_is_mmio(dev) && !!rcu_access_pointer(dev->mmio.npu);
+--- a/mt76_connac_mcu.c
++++ b/mt76_connac_mcu.c
+@@ -1326,7 +1326,8 @@
+ 	if (!mt76_is_mmio(dev))
+ 		return 0;
+ 
+-	if (!mtk_wed_device_active(&dev->mmio.wed))
++	/* Airoha WED has no WO receive firmware to mirror station/BA state. */
++	if (!mt76_wed_has_rx_offload(dev))
+ 		return 0;
+ 
+ 	return mtk_wed_device_update_msg(&dev->mmio.wed, WED_WO_STA_REC,

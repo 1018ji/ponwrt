@@ -1,0 +1,189 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] wifi: mt76: mt7915: add opt-in Airoha NPU capability snapshot
+
+Query verified GET operations and expose the result through debugfs.
+Do not attach the generic NPU layer, reassign DMA queues or enable PPE.
+The fixed-size stock ABI still needs a dedicated RX data path adapter.
+
+---
+--- a/mt7915/Makefile
++++ b/mt7915/Makefile
+@@ -9,3 +9,4 @@
+ mt7915e-$(CONFIG_NL80211_TESTMODE) += testmode.o
+ mt7915e-$(CONFIG_MT798X_WMAC) += soc.o
+ mt7915e-$(CONFIG_DEV_COREDUMP) += coredump.o
++mt7915e-$(CONFIG_MT7915_NPU_PROBE) += npu_probe.o
+--- a/mt7915/Kconfig
++++ b/mt7915/Kconfig
+@@ -14,6 +14,16 @@
+ 
+ 	  To compile this driver as a module, choose M here.
+ 
++config MT7915_NPU_PROBE
++	bool "MT7916 Airoha NPU capability diagnostics"
++	depends on MT7915E && NET_AIROHA_NPU
++	default n
++	help
++	  Add an opt-in, read-only capability probe for an Airoha NPU
++	  referenced by the wireless PCIe node. This does not redirect
++	  wireless traffic or enable RX/TX hardware offloading.
++	  The result is exposed in the read-only npu_probe debugfs file.
++
+ config MT798X_WMAC
+ 	bool "MT798x (SoC) WMAC support"
+ 	depends on MT7915E
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -253,6 +253,15 @@
+ 		u8 spe_idx;
+ 	} test;
+ #endif
++};
++
++struct mt7915_npu_probe {
++	bool attempted;
++	u32 abi;
++	u32 version;
++	u32 support_map;
++	u32 rx_base[2];
++	int error;
+ };
+ 
+ struct mt7915_dev {
+@@ -262,6 +271,7 @@
+ 	};
+ 
+ 	struct mt7915_hif *hif2;
++	struct mt7915_npu_probe npu_probe;
+ 	struct mt7915_reg_desc reg;
+ 	u8 q_id[MT7915_MAX_QUEUE];
+ 	u32 q_int_mask[MT7915_MAX_QUEUE];
+@@ -660,6 +670,14 @@
+ int mt7915_mcu_muru_debug_set(struct mt7915_dev *dev, bool enable);
+ int mt7915_mcu_muru_debug_get(struct mt7915_phy *phy);
+ int mt7915_mcu_wed_enable_rx_stats(struct mt7915_dev *dev);
++#ifdef CONFIG_MT7915_NPU_PROBE
++void mt7915_npu_probe(struct mt7915_dev *dev);
++void mt7915_npu_probe_debugfs(struct mt7915_dev *dev, struct dentry *dir);
++#else
++static inline void mt7915_npu_probe(struct mt7915_dev *dev) {}
++static inline void mt7915_npu_probe_debugfs(struct mt7915_dev *dev,
++					 struct dentry *dir) {}
++#endif
+ int mt7915_init_debugfs(struct mt7915_phy *phy);
+ void mt7915_debugfs_rx_fw_monitor(struct mt7915_dev *dev, const void *data, int len);
+ bool mt7915_debugfs_rx_log(struct mt7915_dev *dev, const void *data, int len);
+--- a/mt7915/pci.c
++++ b/mt7915/pci.c
+@@ -135,6 +135,7 @@
+ 
+ 	mdev = &dev->mt76;
+ 	mt7915_wfsys_reset(dev);
++	mt7915_npu_probe(dev);
+ 
+ 	ret = mt7915_mmio_wed_init(dev, pdev, true, &irq);
+ 	if (ret < 0)
+--- a/mt7915/debugfs.c
++++ b/mt7915/debugfs.c
+@@ -1308,6 +1308,7 @@
+ 	struct dentry *dir;
+ 
+ 	dir = mt76_register_debugfs_fops(phy->mt76, NULL);
++	mt7915_npu_probe_debugfs(dev, dir);
+ 
+ 	debugfs_create_file("muru_debug", 0600, dir, dev, &fops_muru_debug);
+ 	debugfs_create_file("muru_stats", 0400, dir, phy,
+--- /dev/null
++++ b/mt7915/npu_probe.c
+@@ -0,0 +1,91 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* MT7916 / Airoha NPU capability snapshot. No DMA rings are redirected. */
++#include <linux/debugfs.h>
++#include <linux/module.h>
++#include <linux/seq_file.h>
++#include <linux/soc/airoha/airoha_wlan_legacy.h>
++
++#include "mt7915.h"
++
++static bool npu_probe;
++module_param(npu_probe, bool, 0444);
++MODULE_PARM_DESC(npu_probe, "Query Airoha NPU capabilities without enabling offload");
++
++void mt7915_npu_probe(struct mt7915_dev *dev)
++{
++	struct mt7915_npu_probe *probe = &dev->npu_probe;
++	struct airoha_npu *npu;
++	u32 value;
++	int i, err;
++
++	if (!npu_probe || !is_mt7916(&dev->mt76))
++		return;
++
++	probe->attempted = true;
++	npu = airoha_npu_get(dev->mt76.dev);
++	if (IS_ERR(npu)) {
++		probe->error = PTR_ERR(npu);
++		dev_info(dev->mt76.dev, "NPU probe unavailable: %d\n", probe->error);
++		return;
++	}
++
++	probe->abi = npu->wlan_abi;
++	if (probe->abi == AIROHA_NPU_WLAN_ABI_UPSTREAM) {
++		err = mt76_npu_get_msg(npu, 0, WLAN_FUNC_GET_WAIT_NPU_VERSION,
++				       &value, GFP_KERNEL);
++		if (err)
++			goto out;
++		probe->version = value;
++		err = mt76_npu_get_msg(npu, 0, WLAN_FUNC_GET_WAIT_NPU_SUPPORT_MAP,
++				       &value, GFP_KERNEL);
++		if (err)
++			goto out;
++		probe->support_map = value;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(probe->rx_base); i++) {
++		err = mt76_npu_get_msg(npu, i, WLAN_FUNC_GET_WAIT_RXDESC_BASE,
++				       &value, GFP_KERNEL);
++		if (err)
++			goto out;
++		probe->rx_base[i] = value;
++	}
++
++out:
++	probe->error = err;
++	airoha_npu_put(npu);
++	dev_info(dev->mt76.dev,
++		 "NPU probe ABI=%u result=%d RX bases=%08x/%08x; offload disabled\n",
++		 probe->abi, probe->error, probe->rx_base[0], probe->rx_base[1]);
++}
++
++static int mt7915_npu_probe_show(struct seq_file *s, void *unused)
++{
++	struct mt7915_dev *dev = s->private;
++	struct mt7915_npu_probe *probe = &dev->npu_probe;
++
++	seq_printf(s, "attempted: %u\n", probe->attempted);
++	seq_printf(s, "error: %d\n", probe->error);
++	seq_printf(s, "abi: %u\n", probe->abi);
++	seq_printf(s, "version: %08x\n", probe->version);
++	seq_printf(s, "support_map: %08x\n", probe->support_map);
++	seq_printf(s, "rx_base_0: %08x\n", probe->rx_base[0]);
++	seq_printf(s, "rx_base_1: %08x\n", probe->rx_base[1]);
++	if (probe->abi == AIROHA_NPU_WLAN_ABI_HG5585F_2024) {
++		seq_printf(s, "legacy_rx_desc_bytes: %u\n",
++			   AIROHA_WLAN_LEGACY_RX_DESC_BYTES);
++		seq_printf(s, "legacy_rx_desc_count: %u\n",
++			   AIROHA_WLAN_LEGACY_RX_DESC_COUNT);
++		seq_printf(s, "legacy_rx_buf_bytes: %u\n",
++			   AIROHA_WLAN_LEGACY_RX_BUF_BYTES);
++	}
++	seq_puts(s, "rx_offload: disabled\ntx_offload: disabled\n");
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mt7915_npu_probe);
++
++void mt7915_npu_probe_debugfs(struct mt7915_dev *dev, struct dentry *dir)
++{
++	debugfs_create_file("npu_probe", 0400, dir, dev,
++			    &mt7915_npu_probe_fops);
++}

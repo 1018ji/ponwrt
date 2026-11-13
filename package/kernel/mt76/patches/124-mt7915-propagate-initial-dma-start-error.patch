@@ -1,0 +1,21 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] wifi: mt76: mt7915: propagate initial DMA start errors
+
+Return the DMA enable result during initial queue setup. WED buffer
+manager failures must reach the caller instead of continuing firmware
+initialization with stopped DMA and interrupts.
+
+---
+--- a/mt7915/dma.c
++++ b/mt7915/dma.c
+@@ -635,9 +635,7 @@
+ 			  mt7915_poll_tx);
+ 	napi_enable(&dev->mt76.tx_napi);
+ 
+-	mt7915_dma_enable(dev, false);
+-
+-	return 0;
++	return mt7915_dma_enable(dev, false);
+ }
+ 
+ int mt7915_dma_reset(struct mt7915_dev *dev, bool force)

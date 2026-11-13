@@ -1,0 +1,398 @@
+From: PonWrt developers <noreply@localhost>
+Subject: [PATCH] wifi: mt76: connect MT7916 to the Airoha WED transmit path
+
+Use the explicit Airoha WED path and firmware destination lookup for
+ordinary AP frames, with software station IDs for flow ownership. Clear
+station flow state before WCID reuse and quiesce DMA before reset cleanup.
+If the provider cannot prove DMA is stopped, remove host callbacks while
+retaining DMA-owned pages, mappings, descriptors and tokens.
+
+Default WED on only for the opt-in Airoha kernel configuration, and defer
+an explicitly linked consumer until its provider is available.
+
+---
+--- a/dma.c
++++ b/dma.c
+@@ -1195,12 +1195,17 @@
+ 
+ void mt76_dma_cleanup(struct mt76_dev *dev)
+ {
++	bool quarantine = mtk_wed_device_active(&dev->mmio.wed) &&
++		mtk_wed_device_quiesce(&dev->mmio.wed);
+ 	int i;
+ 
+ 	mt76_worker_disable(&dev->tx_worker);
+ 	napi_disable(&dev->tx_napi);
+ 	netif_napi_del(&dev->tx_napi);
+ 
++	if (quarantine)
++		goto detach;
++
+ 	for (i = 0; i < ARRAY_SIZE(dev->phys); i++) {
+ 		struct mt76_phy *phy = dev->phys[i];
+ 		int j;
+@@ -1224,14 +1229,22 @@
+ 		page_pool_destroy(q->page_pool);
+ 	}
+ 
++detach:
+ 	if (mtk_wed_device_active(&dev->mmio.wed))
+ 		mtk_wed_device_detach(&dev->mmio.wed);
+ 
+ 	if (mtk_wed_device_active(&dev->mmio.wed_hif2))
+ 		mtk_wed_device_detach(&dev->mmio.wed_hif2);
+ 
++	if (quarantine) {
++		mt76_for_each_q_rx(dev, i)
++			netif_napi_del(&dev->napi[i]);
++		goto free_napi;
++	}
++
+ 	mt76_free_pending_txwi(dev);
+ 	mt76_free_pending_rxwi(dev);
++free_napi:
+ 	free_netdev(dev->napi_dev);
+ 	free_netdev(dev->tx_napi_dev);
+ }
+--- a/mt7915/dma.c
++++ b/mt7915/dma.c
+@@ -252,11 +252,58 @@
+ 	}
+ }
+ 
++int mt7915_dma_quiesce(struct mt7915_dev *dev)
++{
++	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
++	int err;
++
++	if (!mtk_wed_device_active(wed))
++		return 0;
++	err = mtk_wed_device_quiesce(wed);
++#ifdef CONFIG_NET_AIROHA_WED
++	if (wed->airoha) {
++		u32 offset = dev->hif2 ? MT_WFDMA0_PCIE1(0) - MT_WFDMA0(0) : 0;
++		u32 busy = BIT(1) | BIT(3);
++
++		mt76_clear(dev, MT_WFDMA0_GLO_CFG,
++			   MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN);
++		if (dev->hif2)
++			mt76_clear(dev, MT_WFDMA0_GLO_CFG + offset,
++				   MT_WFDMA0_GLO_CFG_TX_DMA_EN |
++				   MT_WFDMA0_GLO_CFG_RX_DMA_EN);
++		if (!mt76_poll_msec(dev, MT_WFDMA0_GLO_CFG, busy, 0, 100))
++			err = -ETIMEDOUT;
++		if (dev->hif2 &&
++		    !mt76_poll_msec(dev, MT_WFDMA0_GLO_CFG + offset, busy, 0, 100))
++			err = -ETIMEDOUT;
++		/* Prevent firmware from restarting host DMA during cleanup. */
++		pci_clear_master(wed->wlan.pci_dev);
++		if (dev->hif2)
++			pci_clear_master(to_pci_dev(dev->hif2->dev));
++		if (err) {
++			wed->dma_quarantined = true;
++			mtk_wed_device_quiesce(wed);
++		}
++	}
++#endif
++	return err;
++}
++
+ int mt7915_dma_start(struct mt7915_dev *dev, bool reset, bool wed_reset)
+ {
+ 	struct mt76_dev *mdev = &dev->mt76;
+ 	u32 hif1_ofs = 0;
+ 	u32 irq_mask;
++
++#ifdef CONFIG_NET_AIROHA_WED
++	if (mtk_wed_device_active(&mdev->mmio.wed) && mdev->mmio.wed.airoha) {
++		if (mdev->mmio.wed.dma_quarantined)
++			return -EIO;
++		pci_set_master(mdev->mmio.wed.wlan.pci_dev);
++		if (dev->hif2)
++			pci_set_master(to_pci_dev(dev->hif2->dev));
++	}
++#endif
+ 
+ 	if (dev->hif2)
+ 		hif1_ofs = MT_WFDMA0_PCIE1(0) - MT_WFDMA0(0);
+@@ -321,6 +368,12 @@
+ 			return ret;
+ 
+ 		mtk_wed_device_start(&dev->mt76.mmio.wed, wed_irq_mask);
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++		if (!dev->mt76.mmio.wed.running) {
++			mt7915_dma_quiesce(dev);
++			return -EIO;
++		}
++#endif
+ 	}
+ 
+ 	irq_mask = reset ? MT_INT_MCU_CMD : irq_mask;
+@@ -591,7 +644,13 @@
+ {
+ 	struct mt76_phy *mphy_ext = dev->mt76.phys[MT_BAND1];
+ 	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
+-	int i;
++	int i, err;
++
++	if (mtk_wed_device_active(wed)) {
++		err = mt7915_dma_quiesce(dev);
++		if (err)
++			return err;
++	}
+ 
+ 	/* clean up hw queues */
+ 	for (i = 0; i < ARRAY_SIZE(dev->mt76.phy.q_tx); i++) {
+@@ -642,13 +701,12 @@
+ 		mt76_rmw(dev, MT_WFDMA0_EXT0_CFG, MT_WFDMA0_EXT0_RXWB_KEEP,
+ 			 MT_WFDMA0_EXT0_RXWB_KEEP);
+ 
+-	mt7915_dma_enable(dev, !force);
+-
+-	return 0;
++	return mt7915_dma_enable(dev, !force);
+ }
+ 
+ void mt7915_dma_cleanup(struct mt7915_dev *dev)
+ {
++	mt7915_dma_quiesce(dev);
+ 	mt7915_dma_disable(dev, true);
+ 
+ 	mt76_dma_cleanup(&dev->mt76);
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -1289,7 +1289,9 @@
+ 			napi_disable(&dev->mt76.napi[i]);
+ 	}
+ 	mt7915_mcu_exit(dev);
+-	mt76_connac2_tx_token_put(&dev->mt76);
++	if (!mtk_wed_device_active(&dev->mt76.mmio.wed) ||
++	    !mt7915_dma_quiesce(dev))
++		mt76_connac2_tx_token_put(&dev->mt76);
+ 	mt7915_dma_cleanup(dev);
+ 	tasklet_disable(&dev->mt76.irq_tasklet);
+ 
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1299,6 +1299,19 @@
+ 	ext_phy = dev->mt76.phys[MT_BAND1];
+ 	phy2 = ext_phy ? ext_phy->priv : NULL;
+ 
++	if (mtk_wed_device_active(&mdev->mmio.wed)) {
++		ret = mt7915_dma_quiesce(dev);
++		if (ret) {
++			dev->recovery.wed_failed = true;
++			set_bit(MT76_RESET, &dev->mphy.state);
++			if (ext_phy)
++				set_bit(MT76_RESET, &ext_phy->state);
++			mt76_worker_disable(&mdev->tx_worker);
++			return ret;
++		}
++	}
++
++
+ 	if (dev->hif2) {
+ 		mt76_wr(dev, MT_INT1_MASK_CSR, 0x0);
+ 		mt76_wr(dev, MT_INT1_SOURCE_CSR, ~0);
+@@ -1337,13 +1350,18 @@
+ 	mt76_connac2_tx_token_put(&dev->mt76);
+ 	idr_init(&dev->mt76.token);
+ 
+-	mt7915_dma_reset(dev, true);
++	ret = mt7915_dma_reset(dev, true);
++	if (ret)
++		dev->recovery.wed_failed = true;
+ 
+ 	mt76_for_each_q_rx(mdev, i) {
+ 		if (mdev->q_rx[i].ndesc) {
+ 			napi_enable(&dev->mt76.napi[i]);
+ 		}
+ 	}
++
++	if (dev->recovery.wed_failed)
++		goto out;
+ 
+ 	local_bh_disable();
+ 	mt76_for_each_q_rx(mdev, i) {
+@@ -1406,6 +1424,10 @@
+ 	}
+ 
+ out:
++	if (dev->recovery.wed_failed) {
++		napi_enable(&dev->mt76.tx_napi);
++		return ret;
++	}
+ 	/* reset done */
+ 	clear_bit(MT76_RESET, &dev->mphy.state);
+ 	if (phy2)
+@@ -1448,8 +1470,15 @@
+ 
+ 	mutex_lock(&dev->mt76.mutex);
+ 	for (i = 0; i < 10; i++) {
+-		if (!mt7915_mac_restart(dev))
++		if (!mt7915_mac_restart(dev) || dev->recovery.wed_failed)
+ 			break;
++	}
++
++	if (dev->recovery.wed_failed) {
++		dev_err(dev->mt76.dev, "WED could not stop; radio remains stopped\n");
++		dev->recovery.hw_full_reset = false;
++		mutex_unlock(&dev->mt76.mutex);
++		return;
+ 	}
+ 
+ 	if (i == 10)
+@@ -1485,9 +1514,12 @@
+ 	struct mt7915_phy *phy2;
+ 	struct mt76_phy *ext_phy;
+ 	struct mt7915_dev *dev;
+-	int i;
++	int i, ret;
+ 
+ 	dev = container_of(work, struct mt7915_dev, reset_work);
++	if (dev->recovery.wed_failed)
++		return;
++
+ 	ext_phy = dev->mt76.phys[MT_BAND1];
+ 	phy2 = ext_phy ? ext_phy->priv : NULL;
+ 
+@@ -1503,6 +1535,8 @@
+ 			dev->recovery.wm_reset_count++;
+ 
+ 		mt7915_mac_full_reset(dev);
++		if (dev->recovery.wed_failed)
++			return;
+ 
+ 		/* enable mcu irq */
+ 		mt7915_irq_enable(dev, MT_INT_MCU_CMD);
+@@ -1541,13 +1575,19 @@
+ 	napi_disable(&dev->mt76.tx_napi);
+ 
+ 
+-	if (mtk_wed_device_active(&dev->mt76.mmio.wed))
++	if (mtk_wed_device_active(&dev->mt76.mmio.wed)) {
++		ret = mt7915_dma_quiesce(dev);
++		if (ret)
++			goto wed_error;
+ 		mtk_wed_device_stop(&dev->mt76.mmio.wed);
++	}
+ 
+ 	mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_STOPPED);
+ 
+ 	if (mt7915_wait_reset_state(dev, MT_MCU_CMD_RESET_DONE)) {
+-		mt7915_dma_reset(dev, false);
++		ret = mt7915_dma_reset(dev, false);
++		if (ret)
++			goto wed_error;
+ 
+ 		mt76_connac2_tx_token_put(&dev->mt76);
+ 		idr_init(&dev->mt76.token);
+@@ -1600,6 +1640,15 @@
+ 		ieee80211_queue_delayed_work(ext_phy->hw,
+ 					     &phy2->mt76->mac_work,
+ 					     MT7915_WATCHDOG_TIME);
++	return;
++
++wed_error:
++	dev->recovery.wed_failed = true;
++	dev_err(dev->mt76.dev, "WED recovery failed; DMA memory retained\n");
++	mt76_for_each_q_rx(&dev->mt76, i)
++		napi_enable(&dev->mt76.napi[i]);
++	napi_enable(&dev->mt76.tx_napi);
++	mutex_unlock(&dev->mt76.mutex);
+ }
+ 
+ /* firmware coredump */
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -756,6 +756,12 @@
+ 	bool ext_phy = mvif->phy != &dev->phy;
+ 	int idx;
+ 
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	if (mtk_wed_device_active(&mdev->mmio.wed) && mdev->mmio.wed.airoha &&
++	    !mdev->mmio.wed.running)
++		return -EIO;
++#endif
++
+ 	if (mtk_wed_device_active(&dev->mt76.mmio.wed) &&
+ 	    !is_mt7915(&dev->mt76) &&
+ 	    test_bit(MT_WCID_FLAG_4ADDR, &msta->wcid.flags))
+@@ -897,6 +903,11 @@
+ {
+ 	struct mt7915_dev *dev = container_of(mdev, struct mt7915_dev, mt76);
+ 	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
++
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	if (mtk_wed_device_active(&mdev->mmio.wed) && mdev->mmio.wed.airoha)
++		mtk_wed_device_flow_flush(&mdev->mmio.wed, msta->wcid.idx, NULL, NULL);
++#endif
+ 
+ 	mt7915_mac_wtbl_update(dev, msta->wcid.idx,
+ 			       MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
+@@ -1814,6 +1825,14 @@
+ 
+ 	path->type = DEV_PATH_MTK_WDMA;
+ 	path->dev = ctx->dev;
++	if (wed->airoha) {
++		if (vif->type != NL80211_IFTYPE_AP ||
++		    test_bit(MT_WCID_FLAG_4ADDR, &msta->wcid.flags) ||
++		    mvif->mt76.idx > 63)
++			return -EOPNOTSUPP;
++		path->type = DEV_PATH_AIROHA_WDMA;
++		path->mtk_wdma.sta_id = msta->wcid.idx;
++	}
+ 	path->mtk_wdma.wdma_idx = wed->wdma_idx;
+ 	path->mtk_wdma.bss = mvif->mt76.idx;
+ 	path->mtk_wdma.queue = phy->mt76->band_idx;
+--- a/mt7915/mmio.c
++++ b/mt7915/mmio.c
+@@ -2,6 +2,7 @@
+ /* Copyright (C) 2020 MediaTek Inc. */
+ 
+ #include <linux/kernel.h>
++#include <linux/of.h>
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/rtnetlink.h>
+@@ -13,7 +14,7 @@
+ #include "../trace.h"
+ #include "../dma.h"
+ 
+-static bool wed_enable;
++static bool wed_enable = IS_ENABLED(CONFIG_NET_AIROHA_WED);
+ module_param(wed_enable, bool, 0644);
+ MODULE_PARM_DESC(wed_enable, "Enable Wireless Ethernet Dispatch support");
+ 
+@@ -721,8 +722,12 @@
+ 
+ 	dev->mt76.rx_token_size = wed->wlan.rx_npkt;
+ 
+-	if (mtk_wed_device_attach(wed))
++	ret = mtk_wed_device_attach(wed);
++	if (ret) {
++		if (of_property_present(dev->mt76.dev->of_node, "airoha,wed"))
++			return ret == -ENODEV ? -EPROBE_DEFER : ret;
+ 		return 0;
++	}
+ 
+ 	*irq = wed->irq;
+ 	dev->mt76.dma_dev = wed->dev;
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -298,6 +298,7 @@
+ 		u32 state;
+ 		u32 wa_reset_count;
+ 		u32 wm_reset_count;
++		bool wed_failed:1;
+ 		bool hw_full_reset:1;
+ 		bool hw_init_done:1;
+ 		bool restart:1;
+@@ -489,6 +490,7 @@
+ void mt7915_dma_cleanup(struct mt7915_dev *dev);
+ int mt7915_dma_reset(struct mt7915_dev *dev, bool force);
+ int mt7915_dma_start(struct mt7915_dev *dev, bool reset, bool wed_reset);
++int mt7915_dma_quiesce(struct mt7915_dev *dev);
+ int mt7915_txbf_init(struct mt7915_dev *dev);
+ void mt7915_init_txpower(struct mt7915_phy *phy);
+ void mt7915_reset(struct mt7915_dev *dev);
