@@ -9,16 +9,25 @@ log. The switch does not change ownership, force-to-CPU mode, or forwarding.
 ---
 --- a/mt76.h
 +++ b/mt76.h
-@@ -1745,0 +1746,6 @@
+@@ -1743,6 +1743,12 @@
+ }
+ 
+ #ifdef CONFIG_MT76_NPU
 +#ifdef CONFIG_MT76_NPU_LEGACY
 +unsigned int mt76_npu_legacy_debug_level(void);
 +#else
 +static inline unsigned int mt76_npu_legacy_debug_level(void) { return 0; }
 +#endif
 +
+ void mt76_npu_check_ppe(struct mt76_dev *dev, struct sk_buff *skb,
+ 			u32 info);
+ int mt76_npu_dma_add_buf(struct mt76_phy *phy, struct mt76_queue *q,
 --- a/npu.c
 +++ b/npu.c
-@@ -132,0 +133,8 @@
+@@ -130,6 +130,14 @@
+ {
+ 	struct airoha_ppe_dev *ppe_dev;
+ 	u16 reason, hash;
 +
 +	if (mt76_npu_legacy_debug_level() & 2)
 +		dev_info_ratelimited(dev->dev,
@@ -27,11 +36,20 @@ log. The switch does not change ownership, force-to-CPU mode, or forwarding.
 +			(unsigned int)FIELD_GET(NPU_RX_DMA_FOE_ID_MASK, info),
 +			(unsigned int)FIELD_GET(NPU_RX_DMA_CRSN_MASK, info),
 +			(unsigned int)mt76_npu_device_active(dev));
+ 
+ 	if (!mt76_npu_device_active(dev))
+ 		return;
 --- a/npu_rx_legacy.c
 +++ b/npu_rx_legacy.c
-@@ -3,0 +4 @@
+@@ -1,10 +1,43 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ /* HG5585F host RX queues. The caller must quiesce DMA before cleanup. */
+ #include <linux/soc/airoha/airoha_wlan_legacy.h>
 +#include <linux/module.h>
-@@ -7,0 +9,30 @@
+ 
+ #include "mt76.h"
+ #include "dma.h"
+ 
 +static unsigned int legacy_rx_debug;
 +module_param_named(legacy_rx_debug, legacy_rx_debug, uint, 0644);
 +MODULE_PARM_DESC(legacy_rx_debug,
@@ -64,6 +82,15 @@ log. The switch does not change ownership, force-to-CPU mode, or forwarding.
 +                         meta[i].info, meta[i].data);
 +}
 +
-@@ -211,0 +243,2 @@
+ int mt76_npu_legacy_rx_fill(struct mt76_dev *dev, struct mt76_queue *q)
+ {
+ 	struct airoha_wlan_legacy_rx_desc *desc = (void *)q->desc;
+@@ -209,6 +242,8 @@
+ 
+ 	/* Copy into one linear skb; no partial page ownership passes to mac80211. */
+ 	skb = napi_alloc_skb(&dev->napi[q - dev->q_rx], meta[0].total);
 +	if (mt76_npu_legacy_debug_level() & 1)
 +		mt76_npu_legacy_rx_debug_dump(dev, q, meta, count);
+ 	mt76_npu_legacy_rx_retire(dev, q, count, skb, meta);
+ 	if (!skb)
+ 		return ERR_PTR(-ENOMEM);
