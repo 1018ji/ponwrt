@@ -100,6 +100,19 @@ a published queue. Ignore shared interrupts without a pending queue bit.
 +		err = regmap_read(npu->regmap, reg, &base);
 +		if (err)
 +			goto out;
++		/*
++		 * The stock blob leaves a small sentinel (0x457 on HG5585F)
++		 * in the RX base register before the host ring is installed.
++		 * A real legacy ring address is in the 0x1e8xxxxx NPU SRAM
++		 * window; clear only this impossible low-address residue.
++		 */
++		if (base && base < 0x100000) {
++			dev_warn(dev->dev,
++				 "legacy NPU RX%u stale base %08x; clearing before handoff\n",
++				 index, base);
++			regmap_write(npu->regmap, reg, 0);
++			base = 0;
++		}
 +		if (base) {
 +			err = -EBUSY;
 +			goto out;
