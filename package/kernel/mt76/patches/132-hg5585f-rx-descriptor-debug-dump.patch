@@ -26,7 +26,7 @@ log. The switch does not change ownership, force-to-CPU mode, or forwarding.
 +			skb->dev ? skb->dev->name : "?", skb->len, info,
 +			(unsigned int)FIELD_GET(NPU_RX_DMA_FOE_ID_MASK, info),
 +			(unsigned int)FIELD_GET(NPU_RX_DMA_CRSN_MASK, info),
-+			mt76_npu_device_active(dev));
++			(unsigned int)mt76_npu_device_active(dev));
 --- a/npu_rx_legacy.c
 +++ b/npu_rx_legacy.c
 @@ -3,0 +4 @@
@@ -53,13 +53,15 @@ log. The switch does not change ownership, force-to-CPU mode, or forwarding.
 +        for (i = 0; i < count; i++, slot = (slot + 1) % q->ndesc)
 +                dev_info_ratelimited(dev->dev,
 +                         "hg5585f-rx-desc q=%u slot=%u ctrl=%08x info=%08x data=%08x dma=%08x len=%u total=%u frag=%u frags=%u last=%u meta_info=%08x meta_data=%08x\n",
-+                         q - dev->q_rx, slot,
++                         (unsigned int)(q - dev->q_rx), slot,
 +                         le32_to_cpu(READ_ONCE(desc[slot].ctrl)),
 +                         le32_to_cpu(READ_ONCE(desc[slot].info)),
 +                         le32_to_cpu(READ_ONCE(desc[slot].data)),
 +                         le32_to_cpu(READ_ONCE(desc[slot].dma_addr)),
-+                         meta[i].length, meta[i].total, meta[i].fragment,
-+                         meta[i].fragments, meta[i].last, meta[i].info, meta[i].data);
++                         (unsigned int)meta[i].length, (unsigned int)meta[i].total,
++                         (unsigned int)meta[i].fragment,
++                         (unsigned int)meta[i].fragments, (unsigned int)meta[i].last,
++                         meta[i].info, meta[i].data);
 +}
 +
 @@ -211,0 +243,2 @@
