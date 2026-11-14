@@ -89,7 +89,7 @@ a published queue. Ignore shared interrupts without a pending queue bit.
  						   : -EINVAL;
  	if (irq < 0) {
  		err = irq;
-@@ -302,6 +308,18 @@
+@@ -302,6 +308,31 @@
  	if (legacy && q->ndesc) {
  		err = -EBUSY;
  		goto out;
